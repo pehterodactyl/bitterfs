@@ -1,0 +1,113 @@
+% ===========================================================================
+% refs.bib — bibliography for the bitterfs documents
+% ===========================================================================
+%
+% The three @article entries were fetched from doi.org rather than typed:
+%
+%   curl -sSL -H 'Accept: application/x-bibtex' https://doi.org/<DOI> -o entry.bib
+%
+% Do that instead of hand-writing them.  A transposed digit in a DOI does not
+% fail — doi.org happily returns a 10KB HTML error page, and `>` saves it into
+% the .bib, where it becomes an unreadable biber parse error.  Use -o, not `>`,
+% and never pass -f and -s together: that combination fails SILENTLY, leaving
+% an empty file.
+%
+% Everything is \cite'd or \nocite'd somewhere; an entry nothing refers to is
+% invisible in the output, and a document that cites nothing makes biber warn
+% "does not contain any citations!" and print an empty bibliography.
+% ===========================================================================
+
+% --- B-trees, CoW, btrfs ---------------------------------------------------
+
+@article{Rodeh_2008,
+  title     = {B-trees, shadowing, and clones},
+  volume    = {3},
+  ISSN      = {1553-3093},
+  url       = {http://dx.doi.org/10.1145/1326542.1326544},
+  DOI       = {10.1145/1326542.1326544},
+  number    = {4},
+  journal   = {ACM Transactions on Storage},
+  author    = {Rodeh, Ohad},
+  year      = {2008},
+  month     = feb,
+  pages     = {1--27}
+}
+
+@article{Rodeh_2013,
+  title     = {BTRFS: The Linux B-Tree Filesystem},
+  volume    = {9},
+  ISSN      = {1553-3093},
+  url       = {http://dx.doi.org/10.1145/2501620.2501623},
+  DOI       = {10.1145/2501620.2501623},
+  number    = {3},
+  journal   = {ACM Transactions on Storage},
+  author    = {Rodeh, Ohad and Bacik, Josef and Mason, Chris},
+  year      = {2013},
+  month     = aug,
+  pages     = {1--32}
+}
+
+@online{btrfs_docs,
+  title    = {BTRFS documentation},
+  author   = {{btrfs developers}},
+  year     = {2026},
+  url      = {https://btrfs.readthedocs.io/en/latest/},
+  urldate  = {2026-08-24},
+  note     = {On-disk format and internals reference}
+}
+
+% --- CRC ------------------------------------------------------------------
+
+@online{Williams_1993,
+  title    = {A Painless Guide to CRC Error Detection Algorithms},
+  author   = {Williams, Ross N.},
+  year     = {1993},
+  version  = {3},
+  url      = {http://www.ross.net/crc/download/crc_v3.txt},
+  urldate  = {2026-08-26},
+  note     = {Derives CRC from polynomial division through to the table-driven implementation; introduces the Rocksoft parameter model (width, poly, init, refin, refout, xorout, check)}
+}
+
+@online{crc_catalogue,
+  title    = {Catalogue of Parametrised CRC Algorithms},
+  author   = {Cook, Greg},
+  year     = {2026},
+  url      = {https://reveng.sourceforge.io/crc-catalogue/17plus.htm},
+  urldate  = {2026-08-26},
+  note     = {crc32c is the entry named CRC-32/ISCSI: poly=0x1edc6f41, init=0xffffffff, refin=true, refout=true, xorout=0xffffffff, check=0xe3069283}
+}
+
+@article{Castagnoli_1993,
+  title     = {Optimization of cyclic redundancy-check codes with 24 and 32 parity bits},
+  volume    = {41},
+  ISSN      = {0090-6778},
+  url       = {http://dx.doi.org/10.1109/26.231911},
+  DOI       = {10.1109/26.231911},
+  number    = {6},
+  journal   = {IEEE Transactions on Communications},
+  author    = {Castagnoli, G. and Brauer, S. and Herrmann, M.},
+  year      = {1993},
+  month     = jun,
+  pages     = {883--892}
+}
+
+@online{brumme_crc32,
+  title    = {Fast CRC32},
+  author   = {Brumme, Stephan},
+  year     = {2026},
+  url      = {https://create.stephan-brumme.com/crc32/},
+  urldate  = {2026-08-26},
+  note     = {Bitwise, half-byte, table-driven and slicing-by-8 implementations side by side, with benchmarks}
+}
+
+@techreport{rfc3720,
+  title       = {Internet Small Computer Systems Interface (iSCSI)},
+  author      = {Satran, J. and Meth, K. and Sapuntzakis, C. and Chadalapaka, M. and Zeidner, E.},
+  institution = {IETF},
+  type        = {RFC},
+  number      = {3720},
+  year        = {2004},
+  url         = {https://www.rfc-editor.org/rfc/rfc3720.txt},
+  urldate     = {2026-08-26},
+  note        = {Appendix B standardises crc32c, hence the catalogue name CRC-32/ISCSI}
+}

@@ -1,0 +1,407 @@
+\chapter{Notes: C without a standard library}
+\label{ch:freestanding}
+
+Reference notes for the constraints that apply to \lstinline|format/| and
+\lstinline|core/|, gathered while designing the on-disk header. Nothing here is
+specific to bitterfs; it is the C-language and toolchain background that a first
+kernel-level project runs into immediately.
+
+\section{Two conformance modes}
+\label{sec:freestanding-hosted}
+
+The C standard defines two kinds of implementation.
+
+\begin{description}[leftmargin=2.5cm,style=nextline]
+  \item[Hosted] The normal case. The whole standard library is available, the
+    program starts at \lstinline|main|, and the runtime sets up the environment
+    before any of your code runs.
+  \item[Freestanding] What a kernel, a bootloader, or firmware gets. There is no
+    \lstinline|main|, no runtime start-up, and almost no library --- because
+    there is no operating system underneath to provide one.
+\end{description}
+
+A loadable kernel module is freestanding: it is linked into a running kernel
+rather than against libc. That is why \lstinline|printf|, \lstinline|malloc| and
+\lstinline|assert| do not exist there, and why the kernel provides its own
+\lstinline|printk| and \lstinline|kmalloc| instead.
+
+\section{The freestanding headers}
+\label{sec:freestanding-headers}
+
+Freestanding is not \emph{no} headers. The standard requires a small set even in
+freestanding mode, and --- the part that is easy to miss --- these ship with the
+\textbf{compiler}, not with libc:
+
+\begin{center}
+\begin{tabular}{ll}
+  \toprule
+  Header & Provides \\
+  \midrule
+  \lstinline|<stdint.h>|  & \lstinline|uint64_t|, \lstinline|UINT64_MAX|, \lstinline|INT64_C()| \\
+  \lstinline|<stddef.h>|  & \lstinline|size_t|, \lstinline|ptrdiff_t|, \lstinline|offsetof|, \lstinline|NULL| \\
+  \lstinline|<stdarg.h>|  & \lstinline|va_list| and friends \\
+  \lstinline|<limits.h>|  & \lstinline|CHAR_BIT|, \lstinline|INT_MAX| \\
+  \lstinline|<stdbool.h>| & \lstinline|bool|, \lstinline|true|, \lstinline|false| \\
+  \lstinline|<float.h>|, \lstinline|<iso646.h>| & rarely relevant here \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+They contain no code --- only types, limits and macros --- which is exactly why
+they can exist without an operating system.
+
+Their location is worth knowing, because it is what the kernel build removes:
+
+\begin{lstlisting}[style=shell]
+$ gcc -print-file-name=include
+/usr/lib/gcc/x86_64-linux-gnu/13/include
+\end{lstlisting}
+
+GCC's own \lstinline|stdint.h| in that directory is a wrapper that branches on
+whether the build is hosted:
+
+\begin{lstlisting}[style=c]
+#if __STDC_HOSTED__
+# include_next <stdint.h>     /* hand off to glibc's /usr/include/stdint.h */
+#else
+# include "stdint-gcc.h"      /* the compiler's own self-contained version */
+#endif
+\end{lstlisting}
+
+\lstinline|-ffreestanding| sets \lstinline|__STDC_HOSTED__| to 0, so it takes
+the second branch and needs no libc at all. One file, both worlds.
+
+\section{Why the kernel is the exception}
+\label{sec:kernel-nostdinc}
+
+That branch never runs in a kernel module build, because the file is never
+found. The kernel's top-level Makefile contains:
+
+\begin{lstlisting}[style=shell]
+NOSTDINC_FLAGS += -nostdinc
+\end{lstlisting}
+
+and, in 6.12, \textbf{nothing puts the compiler's include directory back}.
+Older kernels appended
+\lstinline|-isystem $(shell $(CC) -print-file-name=include)| on the same line;
+that was removed. A real module build confirms it:
+
+\begin{lstlisting}[style=shell]
+hello.c:35:10: fatal error: stdint.h: No such file or directory
+\end{lstlisting}
+
+Corroborating evidence: the kernel ships its own
+\lstinline|include/linux/stdarg.h|. It would have no reason to carry a copy of
+a compiler-provided header unless it had deliberately cut the compiler's
+include path.
+
+So the availability of \lstinline|<stdint.h>| is not uniform across this
+project:
+
+\begin{center}
+\begin{tabular}{lll}
+  \toprule
+  Directory & Compiled into & \lstinline|<stdint.h>| \\
+  \midrule
+  \lstinline|format/| & everything          & no \\
+  \lstinline|core/|   & the kernel module   & no \\
+  \lstinline|user/|   & ordinary programs   & yes \\
+  \lstinline|tests/|  & ordinary programs   & yes \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+Since \lstinline|format/| is included by all four, it takes the strictest
+constraint: \textbf{it includes nothing, and defines the integer vocabulary
+everything else uses.}
+
+\section{Compiler type macros}
+\label{sec:type-macros}
+
+GCC and Clang predefine \lstinline|__UINT64_TYPE__|, \lstinline|__UINT32_TYPE__|
+and so on. These look like a lower-level alternative to \lstinline|<stdint.h>|,
+but the relationship runs the other way: \textbf{they exist for the header's
+benefit}, and came later than it.
+
+\lstinline|<stdint.h>| is mandated by C99, so somebody must write it, and that
+somebody needs to know the widths the target actually uses. Historically each
+libc shipped its own version full of \lstinline|#if defined(__x86_64__)| chains,
+re-deriving what the compiler already knew --- fragile, and capable of
+disagreeing with the compiler. The macros let the header simply ask. Clang's
+\lstinline|stdint.h| is now largely \lstinline|typedef __UINT64_TYPE__ uint64_t;|.
+
+The header still earns its place, because the typedefs are the small part of it:
+it also supplies \lstinline|UINT64_MAX|, the \lstinline|INT64_C()| literal
+suffixes, \lstinline|intptr_t|, the \lstinline|int_least*_t| and
+\lstinline|int_fast*_t| families, and (via \lstinline|<inttypes.h>|) the
+\lstinline|PRIu64| format macros. And \lstinline|uint64_t| is portable in a way
+the macros are not --- MSVC defines no such thing.
+
+\section{Three vocabularies for the same integers}
+\label{sec:integer-vocabularies}
+
+The same 64-bit unsigned value has three spellings depending on which world the
+code lives in, and \lstinline|format/| is included from all of them.
+
+\begin{center}
+\begin{tabular}{lll}
+  \toprule
+  World & Spelling & Source \\
+  \midrule
+  Standard C          & \lstinline|uint64_t|  & \lstinline|<stdint.h>| \\
+  Linux kernel        & \lstinline|u64|, \lstinline|__le64| & \lstinline|<linux/types.h>| \\
+  Compiler intrinsic  & \lstinline|__UINT64_TYPE__| & predefined macro \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+The kernel's \lstinline|__le64| carries a \lstinline|__bitwise| annotation that
+means nothing to a normal compiler but lets \textbf{sparse}, the kernel's static
+checker, flag any use of a little-endian value where a host-order one was
+expected. That is a real safety net, and it is unavailable in userspace.
+
+Defining our own \lstinline|__le64| in \lstinline|format/| would therefore be
+actively harmful: in a kernel build it would collide with, or silently shadow,
+the annotated one and discard the checking. Any bitterfs types must use their own
+prefix.
+
+\section{Marking endianness}
+\label{sec:endianness-marking}
+
+Everything on disk is little-endian, and the compiler will not enforce that. A
+plain typedef is only a naming convention:
+
+\begin{lstlisting}[style=c]
+typedef uint64_t bt_le64;   /* nothing stops a host-order assignment */
+\end{lstlisting}
+
+On a little-endian host the mistake even works, which is the worst possible
+failure mode --- it surfaces as a corrupt image on somebody else's machine, or
+never, which means the bug is in the code forever.
+
+The alternative is a struct wrapper, which makes the compiler refuse any use that
+does not go through an accessor:
+
+\begin{lstlisting}[style=c]
+typedef struct { uint64_t v; } bt_le64;
+\end{lstlisting}
+
+\decide{Plain typedef or struct wrapper? The wrapper buys compile-time
+enforcement in every build, including userspace where sparse is unavailable. It
+costs clunkier initialisers and noisier field access. Note that the choice is
+\emph{not} about header availability --- \lstinline|<stdint.h>| works in all four
+consumers --- it is purely about whether the type system enforces the
+convention.}
+
+Either way the byte-swapping accessors belong in \lstinline|core/|, not here:
+\lstinline|format/| stays declarations only.
+
+\section{Compile-time assertions}
+\label{sec:static-assert}
+
+\lstinline|_Static_assert| is a C11 \emph{keyword}, so it needs no header. (The
+lower-case \lstinline|static_assert| is a macro from \lstinline|<assert.h>|, which
+is \emph{not} a freestanding header --- prefer the keyword.)
+
+\begin{lstlisting}[style=c]
+_Static_assert(sizeof(struct bitter_key) == 17, "key size changed");
+_Static_assert(__builtin_offsetof(struct bitter_key, offset) == 9, "");
+\end{lstlisting}
+
+Assert field offsets as well as total sizes: a size assertion alone will not
+catch a reordering that happens to preserve the total. \lstinline|offsetof|
+proper comes from \lstinline|<stddef.h>|; \lstinline|__builtin_offsetof| is the
+compiler builtin underneath it and needs nothing.
+
+These assertions are the only machine-checked link between this document and the
+code. Everything else in the format specification is kept true by hand.
+
+\section{Packing}
+\label{sec:packing}
+
+\lstinline|__attribute__((__packed__))| is a GCC and Clang extension, not
+standard C. It removes all padding, which is what an on-disk format requires ---
+padding must be explicit and documented, never inserted by a compiler whose
+choices vary by target.
+
+Two consequences that will surprise you:
+
+\begin{enumerate}
+  \item Member accesses become \textbf{unaligned}. Harmless and only slightly
+    slower on x86; a fault on some architectures.
+  \item \textbf{Taking the address of a packed member warns} under
+    \lstinline|-Waddress-of-packed-member|, because the resulting pointer may be
+    misaligned and dereferencing it is undefined. Expect this the first time you
+    write something like \lstinline|&item->key|; the fix is to copy the member
+    out rather than point into the structure.
+\end{enumerate}
+
+\section{Verifying layout with pahole}
+\label{sec:pahole}
+
+\lstinline|pahole| (from the \lstinline|dwarves| package, already installed for
+the kernel build) reads DWARF debug information and prints a structure's real
+layout --- including \textbf{holes} where padding was inserted.
+
+\begin{lstlisting}[style=shell]
+echo '#include "format/bitterfs_format.h"' > /tmp/t.c
+gcc -g -c -std=c11 -Wall -Wextra -I. /tmp/t.c -o /tmp/t.o
+pahole /tmp/t.o
+\end{lstlisting}
+
+A hole you did not declare means the structure is wrong. The output is also,
+near enough, the field table this document needs --- read the offsets off it
+rather than computing them by hand, and the two cannot disagree.
+
+\section{Accessors the optimiser can see through}
+\label{sec:endian-accessors}
+
+Everything on disk is little-endian, and \lstinline|core/bitter_endian.h| is
+the only file that knows it. The accessors there are the most frequently
+executed code in the filesystem --- a B-tree search binary-searches roughly 160
+items per node across several levels, and every key comparison reads three
+fields --- so their shape was settled by measurement rather than by taste. The
+measurements are recorded here because the resulting code looks worse than the
+obvious version and there would otherwise be a standing temptation to tidy it.
+
+All figures are gcc 13, \lstinline|-O2|, x86-64.
+
+\subsection{The signature}
+
+\begin{lstlisting}[style=c]
+static inline bt_u64 bt_get_le64(const void *p);
+static inline void   bt_put_le64(void *p, bt_u64 v);
+\end{lstlisting}
+
+The little-endian side is always behind a \textbf{pointer} and the host side is
+always a plain value. That is not a stylistic choice: byte order is a property
+of a layout in memory, and a value sitting in a register does not have one.
+A signature like \lstinline|bt_get_le64(bt_le64 v)| would be meaningless.
+
+Two further points about \lstinline|const void *| rather than
+\lstinline|const bt_le64 *|:
+
+\begin{enumerate}
+  \item Every call site passes the address of a \emph{packed} member.
+    Measured: passing \lstinline|&it->key.offset| to a
+    \lstinline|const bt_u64 *| parameter warns under
+    \lstinline|-Waddress-of-packed-member|; passing it to a
+    \lstinline|const void *| parameter does not.
+  \item \lstinline|bt_le64| and \lstinline|bt_u64| are both
+    \lstinline|typedef __UINT64_TYPE__| --- the \emph{same type} to the
+    compiler (\cref{sec:endianness-marking}). A typed parameter would appear
+    to check something while checking nothing. \lstinline|const void *| states
+    what is true: raw bytes, interpreted here.
+\end{enumerate}
+
+The getter's local must be \lstinline|const unsigned char *|. Dropping the
+qualifier compiles, but emits
+\lstinline|initialization discards 'const' qualifier| under
+\lstinline|-Wdiscarded-qualifiers|, and silencing that with a cast rather than
+a qualifier discards the only enforcement the signature had. It matters in
+practice: \lstinline|bitter-dump| has every reason to \lstinline|mmap| an image
+\lstinline|PROT_READ|, and writing through a stripped-\lstinline|const| pointer
+to a genuinely read-only object is a fault, not a wrong answer.
+
+\subsection{Bytes, not a pointer cast}
+
+The tempting implementation is \lstinline|return *(const bt_u64 *)p;|. It is
+wrong twice over:
+
+\begin{description}[leftmargin=2.2cm,style=nextline]
+  \item[Alignment] The structures are packed (\cref{sec:packing}), so many of
+    these addresses are unaligned. Dereferencing a misaligned
+    \lstinline|bt_u64 *| is undefined --- tolerated on x86, a fault elsewhere.
+  \item[Aliasing] Character types are the sole exception to strict aliasing:
+    reading \emph{any} object through an \lstinline|unsigned char *| is
+    explicitly permitted. That rule is what makes the byte-wise version defined
+    rather than merely working today.
+\end{description}
+
+Note which thing is cast. The bytes are indexed first and the resulting
+\textbf{value} is widened; the \textbf{pointer} is never cast. C's precedence
+gives this for free --- \lstinline|[]| is postfix and binds tighter than a
+cast, so \lstinline|(bt_u64)b[1]| parses as \lstinline|(bt_u64)(b[1])|.
+Casting the pointer requires going out of one's way to write
+\lstinline|((const bt_u64 *)b)[1]|.
+
+\subsection{The promotion trap}
+
+The cast must sit inside the shift, not around it:
+
+\begin{center}
+\begin{tabular}{ll}
+  \toprule
+  Expression & Result for \lstinline|b[7] == 0x80| \\
+  \midrule
+  \lstinline|(bt_u64)b[7] << 56|   & \lstinline|0x8000000000000000| \\
+  \lstinline|(bt_u64)(b[7] << 56)| & \lstinline|0x0000000000000000| \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\lstinline|b[7]| promotes to \lstinline|int|, and shifting a 32-bit
+\lstinline|int| by 56 is undefined behaviour --- the whole top byte disappears.
+GCC caught this only because the shift count was a literal constant
+(\lstinline|-Wshift-count-overflow|); written as a loop with a variable count,
+the warning vanishes and the bug does not. UBSan still reports it at runtime,
+which is one concrete reason \lstinline|make -C user SANITIZE=1| exists.
+
+The putter is the mirror image, and the cast moves to the other end:
+
+\begin{lstlisting}[style=c]
+b[7] = (unsigned char)(v >> 56);   /* v is already 64-bit; narrow on the way out */
+\end{lstlisting}
+
+Getter casts first, putter casts last. If the two end up written the same way,
+one of them is wrong.
+
+\subsection{Why the unrolled version, measured}
+
+The natural implementation is a loop. It is correct, and it is what anybody
+would write:
+
+\begin{lstlisting}[style=c]
+bt_u64 num = 0;
+for (int i = 0; i < 8; i++)
+    num += (bt_u64)b[i] << 8*i;
+return num;
+\end{lstlisting}
+
+It is also forty instructions where the alternative is one:
+
+\begin{center}
+\begin{tabular}{ll}
+  \toprule
+  Form & \lstinline|-O2| output \\
+  \midrule
+  loop, \lstinline|+=|                          & 8-iteration loop, ${\sim}40$ instructions \\
+  loop, \lstinline@|=@                          & identical --- the operator is not the cause \\
+  loop, \lstinline|+=|, \lstinline|-funroll-loops| & unrolled, still 8 loads $+$ 8 shifts \\
+  unrolled expression, \lstinline@|@            & \lstinline|movq (%rdi), %rax| \\
+  unrolled expression, \lstinline|+|            & \lstinline|movq (%rdi), %rax| \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+The last two rows are the informative ones: the operator is irrelevant, so the
+\textbf{loop} is what blocks the optimisation. GCC's byte-combining idiom
+recogniser matches a straight-line expression tree and does not reconstruct one
+from a loop --- not even after forced unrolling, because by that point the
+shift counts originate in an induction variable rather than being constants in
+the source.
+
+So the accessors are written out longhand, all eight terms, and the loop is
+preserved as a comment in \lstinline|bitter_endian.h| so the reasoning is not
+rediscovered later. Use \lstinline@|@ rather than \lstinline|+| in the surviving
+version: the compiler emits the same instruction either way, but these are
+disjoint bit ranges being assembled rather than numbers being summed, and a
+reader who sees \lstinline|+| must stop and confirm that no term can carry into
+the next.
+
+\subsection{What this buys on a big-endian host}
+
+The same source compiles to a load plus a \lstinline|bswap|. That is the whole
+reason the file contains no \lstinline|#ifdef| for byte order --- and, in turn,
+why \lstinline|core/| stays free of environment branches and can be compiled
+unchanged into both the kernel module and the userspace tools.

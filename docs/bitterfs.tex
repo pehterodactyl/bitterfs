@@ -1,0 +1,49 @@
+% ===========================================================================
+% bitterfs.tex — master document
+% ===========================================================================
+%
+% Builds every bitterfs document into one PDF with a shared table of contents
+% and working cross-references, so ondisk.tex can \cref the commit protocol by
+% number rather than by name.
+%
+%   make -C docs          build build/bitterfs.pdf
+%   make -C docs watch    rebuild continuously as files change
+%   make -C docs only DOC=ondisk    build one chapter while drafting
+%
+% `report` rather than `article`, so each document is a \chapter.  pandoc
+% conversions use --top-level-division=chapter to match.
+% ===========================================================================
+\documentclass[11pt,a4paper]{report}
+
+\input{preamble}
+
+\title{\textbf{bitterfs}\\[0.5em]
+       \large A copy-on-write B-tree filesystem}
+\author{Pieter Xu}
+\date{\today}
+
+
+\begin{document}
+
+\maketitle
+\tableofcontents
+
+% Each \include is a separate .tex with \chapter at its top level.  \include
+% (rather than \input) gives each one its own page break and its own .aux file,
+% which is what makes `make only DOC=...' able to skip the others while keeping
+% cross-references resolved from the previous full build.
+\include{skeleton}
+\include{ondisk}
+\include{extents}
+\include{kernel}
+\include{files}
+\include{writes}
+\include{notes}
+
+% Planned, once they exist:
+% \include{commit}   % the transaction ordering contract (SKELETON §5)
+% \include{log}      % running notebook: what broke, what was learned
+
+\printbibliography[heading=bibintoc]
+
+\end{document}

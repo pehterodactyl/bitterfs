@@ -1,0 +1,80 @@
+#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+
+#include <linux/fs.h>
+#include <linux/dcache.h>
+#include <linux/mutex.h>
+#include <linux/err.h>
+#include <linux/string.h>
+
+#include "format/bitterfs_format.h"
+#include "core/bitter_endian.h"
+#include "core/btree.h"
+#include "core/items.h"
+#include "core/dir.h"
+#include "kernel/bitterfs.h"
+
+
+static int bitterfs_readdir(struct file *file, struct dir_context *ctx) {
+
+  if (!dir_emit_dots(file, ctx)) {
+    return 0;
+  }
+
+  struct inode* dir = file_inode(file);
+  bt_u64 ino = dir->i_ino;
+  struct super_block* sb = file->i_sb;
+  struct bitterfs_mount* mnt = bitterfs_sb(sb);
+  struct bitter_path path;
+
+  struct bitter_key_cpu key;
+  memset(&key, 0, sizeof(struct bitter_key_cpu));
+  bitter_dir_index_key(&key, ino, (bt_u64)ctx->pos);
+  
+  bitter_path_init(&path);
+  int err= btree_search(&mnt->env, &mnt->fs.fs_root, &key, &path, 0, NULL, 0);
+
+  if (err < 0) {
+    return err;
+  }
+  
+  bt_u32 slot = (bt_u32)path.slots[0];
+
+  for (;;) {
+     
+    bt_u16 name_len = bt_get_le16(&di->name_len); 
+    struct bitter_buf* node = path.nodes[0];
+    bt_u32 nritems = bitter_leaf_nritems(node->b_data);
+    if (slot >= nritems) {
+      if (btree_next_leaf(&mnt->env, &mnt->fs.fs_root, &path)) {
+        break;
+      }
+    }
+
+    struct bitter_item* it = bitter_leaf_item(node->b_data, slot);
+    
+    ctx->pos = bitter_item_get_offset(it);  
+    if (!dir_emit(ctx,
+                  (const char*)di->name,
+                  (int)name_len,
+                  bt_get_le64(&di->location.objectid); 
+                  dt_type)) {
+      break;
+    }
+
+    ctx->pos++;
+
+  }
+
+  return 0; 
+ 
+}
+
+
+const struct file_operations bitterfs_dir_operations = {
+
+  .llseek         = generic_file_llseek,
+  .read           = generic_read_dir,
+  .iterate_shared = bitterfs_readdir,
+  .fsync          = noop_fsync,
+
+};

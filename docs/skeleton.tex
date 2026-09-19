@@ -1,0 +1,1172 @@
+\hypertarget{bitterfs-project-skeleton}{%
+\chapter{bitterfs --- Project Skeleton}\label{bitterfs-project-skeleton}}
+
+\emph{A btrfs-flavored filesystem: copy-on-write B-trees, extents, and snapshots,
+implemented as a Linux kernel module and developed inside QEMU.}
+
+\emph{Stage 2.5 of \href{../ROADMAP.md}{\texttt{../ROADMAP.md}}. Successor to \texttt{journalext}.}
+
+\begin{center}\rule{0.5\linewidth}{0.5pt}\end{center}
+
+\hypertarget{the-thesis}{%
+\section{The thesis}\label{the-thesis}}
+
+\texttt{journalext} answered ``how do I survive a crash?'' with a \textbf{write-ahead log}: write the
+change twice, once to the journal and once in place, and replay the journal on recovery.
+
+bitterfs answers the same question with \textbf{copy-on-write}: never overwrite a live block
+at all. A modification allocates a \emph{new} block, and because the block moved, its parent
+must be rewritten to point at the new location --- which allocates a new parent, and so on
+up to the tree root. A transaction therefore commits by writing a fresh root and
+\textbf{atomically flipping a single pointer in the superblock}. There is no log, no replay,
+and no checkpoint. Recovery is: read the superblock, use the root it points at.
+
+Everything else in this project is downstream of that one idea.
+
+\hypertarget{the-four-features-being-modeled}{%
+\subsection{The four features being modeled}\label{the-four-features-being-modeled}}
+
+\begin{longtable}[]{@{}
+  >{\raggedright\arraybackslash}p{(\columnwidth - 2\tabcolsep) * \real{0.5000}}
+  >{\raggedright\arraybackslash}p{(\columnwidth - 2\tabcolsep) * \real{0.5000}}@{}}
+\toprule\noalign{}
+\begin{minipage}[b]{\linewidth}\raggedright
+Feature
+\end{minipage} & \begin{minipage}[b]{\linewidth}\raggedright
+What it means here
+\end{minipage} \\
+\midrule\noalign{}
+\endhead
+\bottomrule\noalign{}
+\endlastfoot
+\textbf{B-tree} & One generic B-tree implementation. Every piece of metadata --- inodes, directory entries, extent maps, free space --- is an \emph{item} in a tree, keyed by \texttt{(objectid,\ type,\ offset)}. \\
+\textbf{Copy-on-write} & No live block is ever modified in place. Writes go to newly allocated blocks; the change propagates to the root. \\
+\textbf{Snapshots} & A snapshot is a second pointer to the same tree root, plus a refcount bump. It is O(1) and nearly free --- a direct consequence of CoW. \\
+\textbf{Extents} & A file's data is described by \texttt{(file\_offset)\ -\textgreater{}\ (disk\_address,\ length)} ranges, not a per-block pointer array. One item can describe megabytes. \\
+\end{longtable}
+
+\hypertarget{the-design-decisions-already-made}{%
+\subsection{The design decisions already made}\label{the-design-decisions-already-made}}
+
+\begin{itemize}
+\tightlist
+\item
+  \textbf{Kernel module} against the Linux VFS, not FUSE. See §1 for how this is de-risked.
+\item
+  \textbf{QEMU} as the development machine: throwaway guest, real virtio block device.
+\item
+  \textbf{Unified keyspace}, few trees: one B-tree implementation reused for everything.
+\item
+  \textbf{Pure CoW + superblock flip.} No journal. No log tree (initially).
+\end{itemize}
+
+\begin{center}\rule{0.5\linewidth}{0.5pt}\end{center}
+
+\hypertarget{architecture-the-freestanding-core}{%
+\section{Architecture: the freestanding core}\label{architecture-the-freestanding-core}}
+
+The single most important structural decision in this project.
+
+The B-tree, extent allocator, and transaction machinery are written \textbf{once}, in a
+freestanding C library that knows nothing about the kernel. It talks to the outside world
+through a narrow environment interface --- read a block, write a block, allocate memory,
+checksum a buffer. That interface has two implementations: one backed by the kernel's
+buffer cache, one backed by \texttt{pread}/\texttt{pwrite} on a file.
+
+\begin{verbatim}
+                    ┌───────────────────────────────┐
+                    │   core/  (freestanding C)      │
+                    │                                │
+                    │   btree.c    — search/insert/  │
+                    │                delete/split    │
+                    │   cow.c      — CoW + refcounts │
+                    │   extent.c   — allocation tree │
+                    │   trans.c    — commit protocol │
+                    │   inode.c    — item helpers    │
+                    └───────────┬───────────────────┘
+                                │  bitter_env  (the seam)
+                ┌───────────────┴───────────────┐
+                │                               │
+    ┌───────────▼──────────┐       ┌────────────▼─────────────┐
+    │  kernel/             │       │  user/                   │
+    │  env: sb_bread,      │       │  env: pread/pwrite,      │
+    │       kmalloc        │       │       malloc             │
+    │                      │       │                          │
+    │  super.c  inode.c    │       │  mkfs.bitterfs           │
+    │  dir.c    file.c     │       │  bitter-dump             │
+    │  snapshot.c          │       │  bitter-fsck             │
+    │  → struct *_operations│       │  unit tests (valgrind)   │
+    └──────────────────────┘       └──────────────────────────┘
+\end{verbatim}
+
+\textbf{Why this matters:} a B-tree split bug found by a userspace unit test costs you thirty
+seconds. The same bug found by \texttt{insmod} costs you a kernel panic, a reboot, and a
+scroll through \texttt{dmesg}. Push everything you can across the seam into userspace.
+
+\textbf{The constraint it imposes:} \texttt{core/} may not include a single kernel header or libc
+header. No \texttt{printf}, no \texttt{malloc}, no \texttt{assert}, no floating point. Everything it needs
+arrives through \texttt{bitter\_env}. This is a real discipline --- enforce it with a compiler flag
+(\texttt{-ffreestanding\ -nostdinc}) rather than willpower.
+
+\hypertarget{the-seam}{%
+\subsection{The seam}\label{the-seam}}
+
+\begin{Shaded}
+\begin{Highlighting}[]
+\CommentTok{/* core/bitter\_env.h — the only thing core/ knows about the world */}
+
+\KeywordTok{struct}\NormalTok{ bitter\_env\_ops }\OperatorTok{\{}
+    \CommentTok{/* Block I/O.  Returns a mapped, refcounted buffer. */}
+    \KeywordTok{struct}\NormalTok{ bitter\_buf }\OperatorTok{*(*}\NormalTok{read\_block}\OperatorTok{)(}\KeywordTok{struct}\NormalTok{ bitter\_env }\OperatorTok{*,}\NormalTok{ u64 bytenr}\OperatorTok{);}
+    \KeywordTok{struct}\NormalTok{ bitter\_buf }\OperatorTok{*(*}\NormalTok{alloc\_block\_buf}\OperatorTok{)(}\KeywordTok{struct}\NormalTok{ bitter\_env }\OperatorTok{*,}\NormalTok{ u64 bytenr}\OperatorTok{);}
+    \DataTypeTok{void}               \OperatorTok{(*}\NormalTok{dirty\_block}\OperatorTok{)(}\KeywordTok{struct}\NormalTok{ bitter\_env }\OperatorTok{*,} \KeywordTok{struct}\NormalTok{ bitter\_buf }\OperatorTok{*);}
+    \DataTypeTok{void}               \OperatorTok{(*}\NormalTok{put\_block}\OperatorTok{)(}\KeywordTok{struct}\NormalTok{ bitter\_env }\OperatorTok{*,} \KeywordTok{struct}\NormalTok{ bitter\_buf }\OperatorTok{*);}
+
+    \CommentTok{/* Durability barriers — the heart of the commit protocol (§5). */}
+    \DataTypeTok{int}  \OperatorTok{(*}\NormalTok{writeback\_all}\OperatorTok{)(}\KeywordTok{struct}\NormalTok{ bitter\_env }\OperatorTok{*);}   \CommentTok{/* push dirty buffers to device */}
+    \DataTypeTok{int}  \OperatorTok{(*}\NormalTok{flush\_device}\OperatorTok{)(}\KeywordTok{struct}\NormalTok{ bitter\_env }\OperatorTok{*);}    \CommentTok{/* FUA / cache flush */}
+
+    \CommentTok{/* Memory + checksum. */}
+    \DataTypeTok{void} \OperatorTok{*(*}\NormalTok{mem\_alloc}\OperatorTok{)(}\KeywordTok{struct}\NormalTok{ bitter\_env }\OperatorTok{*,} \DataTypeTok{size\_t}\OperatorTok{);}
+    \DataTypeTok{void}  \OperatorTok{(*}\NormalTok{mem\_free}\OperatorTok{)(}\KeywordTok{struct}\NormalTok{ bitter\_env }\OperatorTok{*,} \DataTypeTok{void} \OperatorTok{*);}
+\NormalTok{    u32   }\OperatorTok{(*}\NormalTok{crc32c}\OperatorTok{)(}\NormalTok{u32 seed}\OperatorTok{,} \DataTypeTok{const} \DataTypeTok{void} \OperatorTok{*}\NormalTok{data}\OperatorTok{,} \DataTypeTok{size\_t}\NormalTok{ len}\OperatorTok{);}
+\OperatorTok{\};}
+\end{Highlighting}
+\end{Shaded}
+
+Design the buffer abstraction to map cleanly onto \texttt{struct\ buffer\_head}, since that's the
+side you can't change. The userspace implementation can be as dumb as a malloc'd block
+plus an offset.
+
+\begin{center}\rule{0.5\linewidth}{0.5pt}\end{center}
+
+\hypertarget{locking}{%
+\subsection{Locking}\label{locking}}
+
+Phases 2 through 4 are single-threaded userspace and need no locking at all. From phase 5
+the VFS calls in \emph{concurrently} --- two \texttt{lookup}s on different directories, a
+\texttt{write} while \texttt{readdir} walks the same tree, \texttt{sync} during either --- and
+every one of those paths touches the same B-trees.
+
+\textbf{The constraint.} \texttt{core/} cannot use kernel locks. \texttt{<linux/mutex.h>} is
+no more includable than \texttt{<string.h>}, for the same reason. So locking either becomes
+another seam operation, or it lives entirely outside \texttt{core/}.
+
+\textbf{The decision: one big lock.} \texttt{core/} is \emph{lock-free by contract} --- it
+assumes its caller has already serialised access --- and the kernel module holds a single
+mutex, in the superblock's private data, around every entry point that reaches the trees.
+The seam gains no lock operations.
+
+This is deliberately the crude answer. It permits no concurrency whatsoever: a
+\texttt{readdir} blocks a \texttt{write} on an unrelated file. In exchange it is obviously
+correct, it keeps \texttt{core/} portable, and it can be reasoned about without a lock-order
+diagram. Finer granularity is a phase 10 exercise, and one worth doing only once the
+filesystem works.
+
+\textbf{A mutex, not a spinlock.} Filesystem operations sleep --- block I/O, memory
+allocation with \texttt{GFP\_KERNEL}. Holding a spinlock across either is a bug that
+\texttt{CONFIG\_DEBUG\_ATOMIC\_SLEEP} (already enabled in \texttt{qemu/kernel.config}) will
+catch loudly, which is the good outcome. The bad outcome is the same bug on a kernel built
+without it.
+
+\textbf{What the VFS already holds for you.} You do not start from nothing:
+\texttt{i\_rwsem} is held on the parent inode across directory operations,
+\texttt{s\_umount} across mount and unmount, and the page cache serialises its own
+structures. None of that protects \emph{your} trees, which is why the big lock exists ---
+but it does mean you are not responsible for the namespace's own consistency.
+
+\textbf{What btrfs does instead}, for contrast: a read/write lock per tree \emph{block}
+(\texttt{btrfs\_tree\_lock}, \texttt{btrfs\_tree\_read\_lock}), acquired as the search
+descends and released as the path is popped. That is where
+\texttt{btrfs\_search\_slot}'s \texttt{write\_lock\_level} parameter comes from --- a search
+that may split must take write locks high enough up the tree to cover the split, before it
+knows whether one is needed. Read \texttt{fs/btrfs/locking.c} once for the shape of it, and
+do not implement it before phase 10.
+
+\textbf{Consolidation question.} The big lock serialises everything, so why does the commit
+protocol of §5 still need ordering guarantees? What is the lock protecting you from, and
+what is it \emph{not}?
+
+\begin{center}\rule{0.5\linewidth}{0.5pt}\end{center}
+
+\hypertarget{repository-layout}{%
+\section{Repository layout}\label{repository-layout}}
+
+\begin{verbatim}
+bitterfs/
+├── SKELETON.md                 this file
+├── Makefile                    top-level: builds user tools + tests
+│
+├── format/
+│   └── bitterfs_format.h       ON-DISK STRUCTS ONLY. Shared verbatim by every
+│                               consumer. No functions, no ifdefs on __KERNEL__.
+│
+├── core/
+│   ├── bitter_env.h            the seam (§1)
+│   ├── btree.h  btree.c        search, insert, delete, split, merge
+│   ├── cow.h    cow.c          cow_block(), refcount rules
+│   ├── extent.h extent.c       allocation tree, free space map
+│   ├── trans.h  trans.c        transaction lifecycle + commit
+│   └── items.h  items.c        typed accessors for each item kind
+│
+├── kernel/
+│   ├── Kbuild                  obj-m := bitterfs.o
+│   ├── env_kernel.c            bitter_env over sb_bread/kmalloc
+│   ├── super.c                 file_system_type, super_operations, mount
+│   ├── inode.c                 inode_operations (namespace ops)
+│   ├── dir.c                   directory file_operations (iterate_shared)
+│   ├── file.c                  file file_operations + address_space_operations
+│   ├── ioctl.c                 snapshot/subvolume ioctls
+│   └── bitterfs_kern.h         struct bitterfs_sb_info, bitterfs_inode_info
+│
+├── user/
+│   ├── env_user.c              bitter_env over pread/pwrite
+│   ├── mkfs.c                  mkfs.bitterfs
+│   ├── dump.c                  bitter-dump: print every tree, item by item
+│   └── fsck.c                  bitter-fsck: verify invariants (§9)
+│
+├── tests/
+│   ├── unit/                   core/ tested in isolation, run under valgrind
+│   ├── image/                  golden-image tests: mkfs → mutate → dump → diff
+│   └── crash/                  power-cut harness (§8)
+│
+├── qemu/
+│   ├── kernel.config           guest kernel config fragment
+│   ├── mkinitramfs.sh          busybox initramfs builder
+│   └── run.sh                  the one command that boots everything
+│
+└── docs/
+    ├── ONDISK.md               format spec, written before the code
+    ├── COMMIT.md               the exact ordering rules for a transaction
+    └── LOG.md                  running notebook: what broke, what you learned
+\end{verbatim}
+
+\begin{center}\rule{0.5\linewidth}{0.5pt}\end{center}
+
+\hypertarget{structure-map}{%
+\section{Structure map}\label{structure-map}}
+
+Every structure in the project, which layer owns it, and how they meet. Twelve of
+them, in three groups that never mix: what is written to disk, what
+\texttt{core/} holds in memory, and what a tool keeps to itself.
+
+\subsection{On disk --- \texttt{format/bitterfs\_format.h}}
+
+All packed, all little-endian, all with their sizes and field offsets asserted
+at compile time.
+
+\begin{center}
+\begin{tabular}{llp{7.2cm}}
+  \toprule
+  Structure & Size & Role \\
+  \midrule
+  \lstinline|bitter_super|   & 512 B & The one structure at a fixed address, and the only one never copy-on-written. Overwriting it \emph{is} the commit. \\
+  \lstinline|bitter_header|  & 96 B  & Starts every tree block, leaf and node alike. Self-identifying: csum, fsid, bytenr, generation, owner. \\
+  \lstinline|bitter_key|     & 17 B  & \texttt{(objectid, type, offset)}. The unified keyspace; its sort order is the physical order on disk. \\
+  \lstinline|bitter_item|    & 25 B  & A leaf entry: a key plus where in the block its payload lives. \\
+  \lstinline|bitter_key_ptr| & 33 B  & A node entry: a key plus the child block's address. \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+How they nest inside one 4096-byte block:
+
+\begin{lstlisting}[style=shell]
+LEAF (level 0)                        NODE (level > 0)
++--------------------+                +--------------------+
+| bitter_header  96  |                | bitter_header  96  |
++--------------------+                +--------------------+
+| bitter_item[0]     | 25 each        | bitter_key_ptr[0]  | 33 each
+| bitter_item[1]     |  -> forward    | bitter_key_ptr[1]  |  -> forward
+|      ...           |                |      ...           |
+|   free space       |                |   free space       |
+|      ...           |                +--------------------+
+| payload[1]         |  <- backward
+| payload[0]         |                160 items, or 121 children,
++--------------------+                in the 4000-byte data area
+\end{lstlisting}
+
+\lstinline|bitter_item| and \lstinline|bitter_key_ptr| each \textbf{embed} a
+\lstinline|bitter_key|. \lstinline|bitter_super.root| holds the address of a
+block whose first 96 bytes are a \lstinline|bitter_header|. That is the whole
+on-disk graph: one fixed pointer into a tree of self-describing blocks.
+
+\subsection{In memory, portable --- \texttt{core/}}
+
+None of these are ever written to disk.
+
+\begin{center}
+\begin{tabular}{lp{9cm}}
+  \toprule
+  Structure & Role \\
+  \midrule
+  \lstinline|bitter_env|      & The handle \texttt{core/} threads through every call: a vtable and the environment's private state. \\
+  \lstinline|bitter_env_ops|  & The vtable --- read, allocate, dirty, release. The entire surface between \texttt{core/} and the world. \\
+  \lstinline|bitter_buf|      & One block as \texttt{core/} sees it: \texttt{bytenr}, \texttt{data}, and an opaque handle. Three of \lstinline|struct buffer_head|'s twenty fields. \\
+  \lstinline|bitter_key_cpu|  & A key in host order --- what a \emph{search} is given, since a lookup key was never on disk. \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\lstinline|bitter_key_cpu| is the only one of these with an on-disk
+counterpart. Everything else exists precisely because the on-disk form is
+unsuitable in memory.
+
+\subsection{Tool-local --- \texttt{user/}}
+
+\begin{center}
+\begin{tabular}{lp{9cm}}
+  \toprule
+  Structure & Role \\
+  \midrule
+  \lstinline|env_user|   & What \lstinline|env->priv| points at in userspace: an fd, a path for messages, and a sticky I/O error. \\
+  \lstinline|user_buf|   & Wraps a \lstinline|bitter_buf| with a dirty flag and the block's storage. Private to \texttt{env\_user.c}. \\
+  \lstinline|check_desc| & One row of \texttt{bitter-dump}'s validation table: a flag bit and its description. \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Where the layers meet}
+
+\begin{lstlisting}[style=shell]
+core/ wants block 0x11000
+   |
+   v
+env->ops->read_block(env, 0x11000)
+   |                    |
+   |                    +-- env->priv --> env_user { fd, path }
+   v
+user_env_read_block: malloc user_buf, pread into .data
+   |
+   +-- returns &user_buf.pub          (a bitter_buf *)
+   |
+   v
+core/ reads buf->b_data --- cast ---> struct bitter_header *
+                                      struct bitter_item[] ...
+\end{lstlisting}
+
+\lstinline|b_data| is the bridge, and it is deliberately a bare
+\lstinline|void *|. The seam delivers 4096 anonymous bytes; \texttt{format/}
+says what they mean. Nothing in \lstinline|bitter_env.h| mentions a header or
+an item, and nothing in \lstinline|format/| mentions a buffer --- which is what
+lets the same \texttt{core/} run over \texttt{pread} and over
+\lstinline|sb_bread| without an \texttt{\#ifdef}.
+
+\subsection{Functions, by file}
+
+\begin{lstlisting}[style=shell]
+format/bitterfs_format.h   no functions -- declarations and assertions only
+
+core/bitter_endian.h       bt_get_le16/32/64, bt_put_le16/32/64
+core/bitter_crc32c.{c,h}   bt_crc32c
+core/crc32c_table.h        generated data
+core/bitter_env.h          no functions -- the vtable's shape
+core/items.{c,h}           key comparison, leaf accessors
+
+user/util.{c,h}            set_progname, get_progname, die, die_errno
+user/print.{c,h}           format_uuid, human, print_section, print_str/u32/
+                           u64/hex64/size/uuid/bytes, print_check, hexdump
+user/env_user.{c,h}        bitter_env_user_init + the four static ops
+user/mkfs.c                format_super, format_empty_leaf, device_size,
+                           write_block, main
+user/dump.c                read_block, block_csum, check_super, check_header,
+                           report_checks, print_super, print_header, main
+
+tools/gen_crc32c_table.c   main -- build-time only, never linked
+\end{lstlisting}
+
+\decide{\texttt{mkfs.c} and \texttt{dump.c} each carry their own
+\lstinline|write_block| and \lstinline|read_block| doing direct
+\texttt{pread}/\texttt{pwrite}, written before the seam existed. There are
+therefore two ways to reach a block, and only one of them works in the kernel.
+Retrofitting both tools onto \lstinline|bitter_env| would prove the interface
+and remove the duplication; leaving them alone costs nothing until something
+needs to share code with \texttt{core/}.}
+
+\begin{center}\rule{0.5\linewidth}{0.5pt}\end{center}
+
+\hypertarget{on-disk-format}{%
+\section{On-disk format}\label{on-disk-format}}
+
+Write \texttt{docs/ONDISK.md} \textbf{before} writing \texttt{mkfs}. A format you can't describe in prose
+you can't debug at 2am. Everything is little-endian on disk; use explicit \texttt{\_\_le32}/\texttt{\_\_le64}
+types and accessor macros so the compiler catches missed byte swaps.
+
+\hypertarget{the-key-the-central-abstraction}{%
+\subsection{The key --- the central abstraction}\label{the-key-the-central-abstraction}}
+
+\begin{Shaded}
+\begin{Highlighting}[]
+\KeywordTok{struct}\NormalTok{ bitter\_key }\OperatorTok{\{}
+\NormalTok{    \_\_le64 objectid}\OperatorTok{;}   \CommentTok{/* which object this item belongs to */}
+\NormalTok{    u8     type}\OperatorTok{;}       \CommentTok{/* what kind of item it is           */}
+\NormalTok{    \_\_le64 offset}\OperatorTok{;}     \CommentTok{/* meaning depends on type           */}
+\OperatorTok{\}}\NormalTok{ \_\_packed}\OperatorTok{;}
+\end{Highlighting}
+\end{Shaded}
+
+Keys sort by \texttt{objectid}, then \texttt{type}, then \texttt{offset}. That ordering is not arbitrary ---
+it is what makes every important operation a \textbf{contiguous range scan}:
+
+\begin{itemize}
+\tightlist
+\item
+  All items for inode 5 are adjacent → \texttt{stat} and \texttt{unlink} touch one region.
+\item
+  All \texttt{EXTENT\_DATA} for inode 7, in file-offset order → sequential read is a linear walk.
+\item
+  All \texttt{DIR\_ITEM} for a directory, in hash order → \texttt{readdir} is one traversal.
+\end{itemize}
+
+Getting this ordering right is most of the design.
+
+\hypertarget{item-types}{%
+\subsection{Item types}\label{item-types}}
+
+\begin{longtable}[]{@{}
+  >{\raggedright\arraybackslash}p{(\columnwidth - 6\tabcolsep) * \real{0.2500}}
+  >{\raggedright\arraybackslash}p{(\columnwidth - 6\tabcolsep) * \real{0.2500}}
+  >{\raggedright\arraybackslash}p{(\columnwidth - 6\tabcolsep) * \real{0.2500}}
+  >{\raggedright\arraybackslash}p{(\columnwidth - 6\tabcolsep) * \real{0.2500}}@{}}
+\toprule\noalign{}
+\begin{minipage}[b]{\linewidth}\raggedright
+Type
+\end{minipage} & \begin{minipage}[b]{\linewidth}\raggedright
+objectid
+\end{minipage} & \begin{minipage}[b]{\linewidth}\raggedright
+offset
+\end{minipage} & \begin{minipage}[b]{\linewidth}\raggedright
+Payload
+\end{minipage} \\
+\midrule\noalign{}
+\endhead
+\bottomrule\noalign{}
+\endlastfoot
+\texttt{INODE\_ITEM} & inode number & 0 & mode, uid, gid, size, nlink, timestamps, generation \\
+\texttt{INODE\_REF} & inode number & parent inode & name --- the backref, for \texttt{..} and hardlink accounting \\
+\texttt{DIR\_ITEM} & parent inode & hash(name) & name + the key of the target \\
+\texttt{DIR\_INDEX} & parent inode & sequence number & same, but ordered for stable \texttt{readdir} \\
+\texttt{EXTENT\_DATA} & inode number & file offset & disk address, disk length, offset-into-extent, length \\
+\texttt{EXTENT\_ITEM} & disk address & extent length & \textbf{refcount} --- lives in the extent tree \\
+\texttt{ROOT\_ITEM} & subvolume id & 0 & root node address + generation --- lives in the root tree \\
+\end{longtable}
+
+Two questions to resolve before you write the header, both of which have real
+consequences:
+
+\begin{enumerate}
+\def\labelenumi{\arabic{enumi}.}
+\tightlist
+\item
+  Why does \texttt{DIR\_ITEM} (hash-ordered) coexist with \texttt{DIR\_INDEX} (sequence-ordered)?
+  What breaks if you keep only one?
+\item
+  Why does \texttt{EXTENT\_DATA} carry \emph{both} an offset-into-the-extent and a length, rather than
+  just a disk address and a length?
+\end{enumerate}
+
+\hypertarget{node-and-leaf-layout}{%
+\subsection{Node and leaf layout}\label{node-and-leaf-layout}}
+
+Every tree block, internal or leaf, starts with the same header:
+
+\begin{Shaded}
+\begin{Highlighting}[]
+\KeywordTok{struct}\NormalTok{ bitter\_header }\OperatorTok{\{}
+\NormalTok{    u8     csum}\OperatorTok{[}\NormalTok{BITTER\_CSUM\_SIZE}\OperatorTok{];}  \CommentTok{/* crc32c over everything after this field */}
+\NormalTok{    u8     fsid}\OperatorTok{[}\DecValTok{16}\OperatorTok{];}
+\NormalTok{    \_\_le64 bytenr}\OperatorTok{;}        \CommentTok{/* this block\textquotesingle{}s own address — catches misdirected writes */}
+\NormalTok{    \_\_le64 generation}\OperatorTok{;}    \CommentTok{/* the transaction that wrote it — the CoW witness */}
+\NormalTok{    \_\_le64 owner}\OperatorTok{;}         \CommentTok{/* which tree this block belongs to */}
+\NormalTok{    \_\_le32 nritems}\OperatorTok{;}
+\NormalTok{    u8     level}\OperatorTok{;}         \CommentTok{/* 0 == leaf */}
+\OperatorTok{\}}\NormalTok{ \_\_packed}\OperatorTok{;}
+\end{Highlighting}
+\end{Shaded}
+
+\texttt{generation} is the field that makes CoW auditable: a block whose generation equals the
+current transaction's is already fresh and may be modified in place; anything older must
+be copied first. That single comparison is the entire CoW decision.
+
+\textbf{Internal nodes} are a flat array of \texttt{(key,\ block\_pointer,\ generation)}.
+
+\textbf{Leaves} grow from both ends: fixed-size \texttt{bitter\_item} descriptors (key, offset, size)
+march forward from the header, while variable-length payloads stack backward from the end
+of the block. Free space is the gap in the middle. Sketch this on paper before coding it ---
+the arithmetic is where the bugs live.
+
+\begin{verbatim}
+┌────────┬──────┬──────┬──────┬─────────────────┬────────┬────────┬────────┐
+│ header │ itm0 │ itm1 │ itm2 │  ← free space → │ data2  │ data1  │ data0  │
+└────────┴──────┴──────┴──────┴─────────────────┴────────┴────────┴────────┘
+\end{verbatim}
+
+\hypertarget{superblock}{%
+\subsection{Superblock}\label{superblock}}
+
+Kept at a fixed offset (btrfs uses 64KiB; mirrored copies are optional). It holds the
+magic, fsid, block size, total size, and --- the only field that actually commits a
+transaction --- the \textbf{root tree address} plus its generation.
+
+Keep the superblock small enough to fit in one sector, so the device's atomic-write
+guarantee covers it. If it spans sectors, a torn write can leave you with half of one
+transaction and half of another, and pure CoW loses its safety property entirely.
+
+\hypertarget{the-trees}{%
+\subsection{The trees}\label{the-trees}}
+
+\begin{longtable}[]{@{}
+  >{\raggedright\arraybackslash}p{(\columnwidth - 4\tabcolsep) * \real{0.3333}}
+  >{\raggedright\arraybackslash}p{(\columnwidth - 4\tabcolsep) * \real{0.3333}}
+  >{\raggedright\arraybackslash}p{(\columnwidth - 4\tabcolsep) * \real{0.3333}}@{}}
+\toprule\noalign{}
+\begin{minipage}[b]{\linewidth}\raggedright
+Tree
+\end{minipage} & \begin{minipage}[b]{\linewidth}\raggedright
+Root found via
+\end{minipage} & \begin{minipage}[b]{\linewidth}\raggedright
+Holds
+\end{minipage} \\
+\midrule\noalign{}
+\endhead
+\bottomrule\noalign{}
+\endlastfoot
+\textbf{Root tree} & the superblock & \texttt{ROOT\_ITEM}s --- one per subvolume/snapshot, plus the extent tree's root \\
+\textbf{FS tree(s)} & a \texttt{ROOT\_ITEM} & inodes, dirents, extent maps. One per subvolume. A snapshot creates a new one. \\
+\textbf{Extent tree} & a \texttt{ROOT\_ITEM} & which disk ranges are allocated, and \textbf{how many trees reference each} \\
+\end{longtable}
+
+Three trees, one implementation. The chunk tree, device tree, and checksum tree of real
+btrfs are deliberately omitted --- they serve multi-device RAID, which is machinery without
+insight at this stage.
+
+\begin{center}\rule{0.5\linewidth}{0.5pt}\end{center}
+
+\hypertarget{the-core-algorithms}{%
+\section{The core algorithms}\label{the-core-algorithms}}
+
+Each is named with a one-line description. Ask when you want to go deeper on any of them ---
+that's what the advisory arrangement is for.
+
+\hypertarget{phase-2-keystones-userspace-testable}{%
+\subsection{Phase-2 keystones (userspace, testable)}\label{phase-2-keystones-userspace-testable}}
+
+\textbf{\texttt{btree\_search}} --- walks from the root to the leaf that should contain a key, leaving a
+path of held blocks behind it.
+
+Everything else calls this. The return convention matters more than the traversal: callers
+need to distinguish ``found exactly'' from ``not found, but here is the insertion point,'' and
+they need the whole root-to-leaf path retained, because CoW will have to rewrite every
+block on it. Design \texttt{struct\ bitter\_path} first; \texttt{btree\_search} follows from it.
+
+\textbf{\texttt{btree\_insert\_item}} --- makes room in a leaf for a new key and payload, splitting if
+needed.
+
+\textbf{\texttt{btree\_split\_leaf}} --- the hard one, because leaves hold variable-sized items and
+splitting ``in the middle'' is a size decision, not an index decision.
+
+\textbf{\texttt{btree\_del\_item}} --- removes an item and compacts the leaf's payload region.
+
+Balancing/merging on delete can be deferred. An unbalanced tree is slow; a tree that
+loses items is broken. Get correctness first, and be explicit in \texttt{docs/LOG.md} about the
+debt.
+
+\hypertarget{phase-3-keystone}{%
+\subsection{Phase-3 keystone}\label{phase-3-keystone}}
+
+\textbf{\texttt{btree\_cow\_block}} --- given a block and the current transaction, returns a writable copy
+of it at a newly allocated address, and patches the parent to point there.
+
+This is the heart of the filesystem. Three cases it must distinguish:
+
+\begin{enumerate}
+\def\labelenumi{\arabic{enumi}.}
+\tightlist
+\item
+  Block's \texttt{generation} == current transaction → already ours this transaction, write in place.
+\item
+  Block's refcount \textgreater{} 1 → shared with a snapshot, must copy, must \emph{not} free the original.
+\item
+  Otherwise → copy, and the original becomes free once this transaction commits.
+\end{enumerate}
+
+Note the recursion: patching the parent means CoW'ing the parent, up to the root. And note
+where the recursion stops --- at the tree root, whose new address is recorded in a
+\texttt{ROOT\_ITEM}, which lives in the root tree, whose new address goes in the superblock.
+
+\hypertarget{phase-4-keystones}{%
+\subsection{Phase-4 keystones}\label{phase-4-keystones}}
+
+\textbf{\texttt{extent\_alloc}} --- finds a free range of the requested size and marks it in-use for this
+transaction.
+
+There is a circularity trap here worth seeing before you hit it: allocating a block
+requires updating the extent tree, and updating the extent tree requires CoW, and CoW
+requires allocating a block. Real btrfs escapes with delayed refs. The recommended
+simplification: keep an \textbf{in-memory free-space map}, rebuilt by scanning the extent tree
+at mount, satisfy all allocations from memory during a transaction, and write the extent
+tree updates once at commit time. Document the tradeoff (mount cost scales with
+filesystem size) in \texttt{docs/LOG.md}.
+
+\textbf{\texttt{extent\_inc\_ref} / \texttt{extent\_dec\_ref}} --- adjust an extent's reference count; free the
+range when it reaches zero.
+
+Refcounting is what makes snapshots work and what makes them safe to delete. This is the
+one place where an off-by-one silently corrupts data --- a range freed while still
+referenced will be handed out again and overwritten. \texttt{bitter-fsck} exists mostly to catch
+this.
+
+\hypertarget{phase-5-keystones}{%
+\subsection{Phase-5+ keystones}\label{phase-5-keystones}}
+
+\textbf{\texttt{bitterfs\_iget}} --- fetches an inode by number: allocates the VFS inode, reads the
+\texttt{INODE\_ITEM}, and populates both the VFS fields and the private ones.
+
+\textbf{\texttt{bitterfs\_lookup\_extent}} --- maps a file offset to a disk address by finding the
+\texttt{EXTENT\_DATA} item covering it. The read path's \texttt{namei}.
+
+\textbf{\texttt{trans\_commit}} --- the ordering protocol of §5, and the only function permitted to write
+the superblock.
+
+\textbf{\texttt{snapshot\_create}} --- copies a \texttt{ROOT\_ITEM} under a new subvolume id and increments the
+refcount on the shared root node.
+
+Worth appreciating when you get there: this function is about twenty lines. All the work
+that makes snapshots correct was already done by \texttt{btree\_cow\_block}'s refcount check.
+
+\begin{center}\rule{0.5\linewidth}{0.5pt}\end{center}
+
+\hypertarget{the-commit-protocol}{%
+\section{The commit protocol}\label{the-commit-protocol}}
+
+The one thing that must be exactly right. Write it down in \texttt{docs/COMMIT.md} and treat it
+as a contract.
+
+\begin{verbatim}
+1. Write every new/modified data extent to disk.
+2. Write every CoW'd tree block to disk (fs trees, then extent tree).
+3. FLUSH the device cache.            ← barrier: everything above is now durable
+4. Write the new root tree block.
+5. FLUSH the device cache.            ← barrier
+6. Write the superblock, pointing at the new root tree.  (FUA)
+7. FLUSH the device cache.
+\end{verbatim}
+
+\textbf{Why every step is there.} Steps 3 and 5 are the whole game. Without them the device is
+free to reorder, and a superblock that reaches the platter before the tree it points at
+leaves you with a root pointing into garbage --- a filesystem that is \emph{more} broken than one
+with no CoW at all. On Linux this means \texttt{blkdev\_issue\_flush()} or a \texttt{REQ\_PREFLUSH\ \textbar{}\ REQ\_FUA} bio, and it is the single easiest thing in this project to forget, because
+\textbf{omitting it works perfectly until the moment you actually lose power.}
+
+The invariant, stated once: \emph{at every instant, the on-disk superblock points at a
+completely written, internally consistent tree.} A crash at any point above either lands
+before step 6 (you get the previous transaction, whole) or after (you get the new one,
+whole). There is no third outcome, and that is the entire correctness argument for
+this filesystem.
+
+\begin{center}\rule{0.5\linewidth}{0.5pt}\end{center}
+
+\hypertarget{the-kernel-module}{%
+\section{The kernel module}\label{the-kernel-module}}
+
+\hypertarget{vfs-surface}{%
+\subsection{VFS surface}\label{vfs-surface}}
+
+\begin{longtable}[]{@{}
+  >{\raggedright\arraybackslash}p{(\columnwidth - 2\tabcolsep) * \real{0.5000}}
+  >{\raggedright\arraybackslash}p{(\columnwidth - 2\tabcolsep) * \real{0.5000}}@{}}
+\toprule\noalign{}
+\begin{minipage}[b]{\linewidth}\raggedright
+Structure
+\end{minipage} & \begin{minipage}[b]{\linewidth}\raggedright
+Members that matter here
+\end{minipage} \\
+\midrule\noalign{}
+\endhead
+\bottomrule\noalign{}
+\endlastfoot
+\texttt{file\_system\_type} & \texttt{.init\_fs\_context}, \texttt{.kill\_sb\ =\ kill\_block\_super}, \texttt{.fs\_flags\ =\ FS\_REQUIRES\_DEV} \\
+\texttt{fs\_context\_operations} & \texttt{.get\_tree} → \texttt{get\_tree\_bdev(fc,\ bitterfs\_fill\_super)} \\
+\texttt{super\_operations} & \texttt{.alloc\_inode}, \texttt{.free\_inode}, \texttt{.write\_inode}, \texttt{.evict\_inode}, \texttt{.put\_super}, \texttt{.statfs}, \texttt{.sync\_fs} \\
+\texttt{inode\_operations} (dir) & \texttt{.lookup}, \texttt{.create}, \texttt{.mkdir}, \texttt{.rmdir}, \texttt{.unlink}, \texttt{.rename}, \texttt{.link}, \texttt{.symlink}, \texttt{.setattr}, \texttt{.getattr} \\
+\texttt{file\_operations} (dir) & \texttt{.iterate\_shared}, \texttt{.llseek} \\
+\texttt{file\_operations} (file) & \texttt{.read\_iter}, \texttt{.write\_iter}, \texttt{.mmap}, \texttt{.fsync}, \texttt{.unlocked\_ioctl} \\
+\texttt{address\_space\_operations} & \texttt{.read\_folio}, \texttt{.writepages}, \texttt{.write\_begin}, \texttt{.write\_end}, \texttt{.dirty\_folio} \\
+\end{longtable}
+
+Two structures to define early:
+
+\begin{itemize}
+\tightlist
+\item
+  \texttt{struct\ bitterfs\_sb\_info} --- hangs off \texttt{sb-\textgreater{}s\_fs\_info}. Holds the \texttt{bitter\_env}, the
+  current transaction, the root tree handle, the in-memory free-space map, and the locks.
+\item
+  \texttt{struct\ bitterfs\_inode\_info} --- your per-inode state with a \texttt{struct\ inode\ vfs\_inode}
+  embedded. Allocated from a dedicated slab cache. \texttt{container\_of} converts between them;
+  write the helper once and never open-code it.
+\end{itemize}
+
+\hypertarget{the-cowpage-cache-collision}{%
+\subsection{The CoW/page-cache collision}\label{the-cowpage-cache-collision}}
+
+Expect this and plan for it. The generic page-cache write helpers
+(\texttt{block\_write\_begin} and friends) assume a \textbf{stable} block mapping: they ask your
+\texttt{get\_block} callback where file offset N lives, and then write there. Under CoW, that
+answer changes on every single write. The generic path is structurally incompatible with
+the thing you are building --- this is exactly why btrfs carries its own \texttt{writepages} and
+delayed-allocation machinery instead of using the generic helpers.
+
+Recommended staging:
+
+\begin{enumerate}
+\def\labelenumi{\arabic{enumi}.}
+\tightlist
+\item
+  \textbf{Read path first}, using \texttt{read\_folio} with an extent-lookup \texttt{get\_block}. Reads don't
+  move blocks, so the generic helpers are safe here.
+\item
+  \textbf{Write path with immediate allocation}: a custom \texttt{write\_begin} that allocates the new
+  extent \emph{up front}, records it, and hands back a page mapped to the new location.
+  Simpler than delayed allocation and still genuinely CoW.
+\item
+  \textbf{Delayed allocation} (allocate at writeback, so sequential writes coalesce into large
+  extents) only if you want it later. This is where real filesystems earn their
+  performance, and it is a project in itself.
+\end{enumerate}
+
+Set \texttt{.bmap\ =\ NULL} and \texttt{.direct\_IO\ =\ NULL}. Both hand out stable block addresses to
+external callers, and under CoW there is no such thing.
+
+\hypertarget{version-churn}{%
+\subsection{Version churn}\label{version-churn}}
+
+VFS method signatures change between kernel releases --- \texttt{mkdir} alone has changed shape
+more than once in recent years. \textbf{Pin one kernel version at the start and stay on it.}
+\texttt{Documentation/filesystems/porting.rst} is the changelog for these breakages, and
+\texttt{Documentation/filesystems/vfs.rst} is the contract itself. Both live in the kernel tree
+you're already building.
+
+\begin{center}\rule{0.5\linewidth}{0.5pt}\end{center}
+
+\hypertarget{the-qemu-environment}{%
+\section{The QEMU environment}\label{the-qemu-environment}}
+
+Build this in Phase 0, before a single line of filesystem code. A dev loop you trust is
+worth more than a head start on the B-tree.
+
+\hypertarget{recommended-shape}{%
+\subsection{Recommended shape}\label{recommended-shape}}
+
+Build your own kernel from source and boot it directly with a busybox initramfs. Boot
+time is on the order of a second, \texttt{dmesg} goes straight to your terminal, and the module
+is always built against exactly the tree you booted.
+
+\begin{Shaded}
+\begin{Highlighting}[]
+\ExtensionTok{qemu{-}system{-}x86\_64} \DataTypeTok{\textbackslash{}}
+  \AttributeTok{{-}enable{-}kvm} \AttributeTok{{-}cpu}\NormalTok{ host }\AttributeTok{{-}m}\NormalTok{ 2G }\DataTypeTok{\textbackslash{}}
+  \AttributeTok{{-}kernel}  \VariableTok{$LINUX}\NormalTok{/arch/x86/boot/bzImage }\DataTypeTok{\textbackslash{}}
+  \AttributeTok{{-}initrd}\NormalTok{  qemu/initramfs.cpio.gz }\DataTypeTok{\textbackslash{}}
+  \AttributeTok{{-}append}  \StringTok{"console=ttyS0 nokaslr panic=1"} \DataTypeTok{\textbackslash{}}
+  \AttributeTok{{-}drive}\NormalTok{   file=bitter.img,if=virtio,format=raw }\DataTypeTok{\textbackslash{}}
+  \AttributeTok{{-}virtfs}\NormalTok{  local,path=}\VariableTok{$PWD}\NormalTok{,mount\_tag=src,security\_model=none }\DataTypeTok{\textbackslash{}}
+  \AttributeTok{{-}nographic}
+\end{Highlighting}
+\end{Shaded}
+
+\begin{longtable}[]{@{}
+  >{\raggedright\arraybackslash}p{(\columnwidth - 2\tabcolsep) * \real{0.5000}}
+  >{\raggedright\arraybackslash}p{(\columnwidth - 2\tabcolsep) * \real{0.5000}}@{}}
+\toprule\noalign{}
+\begin{minipage}[b]{\linewidth}\raggedright
+Flag
+\end{minipage} & \begin{minipage}[b]{\linewidth}\raggedright
+Why
+\end{minipage} \\
+\midrule\noalign{}
+\endhead
+\bottomrule\noalign{}
+\endlastfoot
+\texttt{-kernel} / \texttt{-initrd} & no bootloader, no installed distro, \textasciitilde1s boot \\
+\texttt{-drive\ if=virtio} & a genuine block device at \texttt{/dev/vda}, not a loop-mounted file \\
+\texttt{-virtfs} & \texttt{mount\ -t\ 9p\ -o\ trans=virtio\ src\ /mnt/src} --- build on the host, \texttt{insmod} in the guest, no image rebuild between iterations \\
+\texttt{-nographic} + \texttt{console=ttyS0} & \texttt{printk} lands in your scrollback \\
+\texttt{nokaslr} & so addresses in an oops match your \texttt{vmlinux} symbols \\
+\texttt{panic=1} & reboot on panic instead of hanging, so a bad \texttt{insmod} doesn't cost you a window \\
+\end{longtable}
+
+\hypertarget{kernel-config-for-the-guest}{%
+\subsection{Kernel config for the guest}\label{kernel-config-for-the-guest}}
+
+\texttt{CONFIG\_DEBUG\_INFO} and \texttt{CONFIG\_GDB\_SCRIPTS} (source-level debugging), \texttt{CONFIG\_KASAN}
+(catches your use-after-free before it corrupts someone else's memory),
+\texttt{CONFIG\_PROVE\_LOCKING} (lockdep --- will find deadlocks you'd never reproduce by hand),
+\texttt{CONFIG\_DEBUG\_KERNEL}, \texttt{CONFIG\_9P\_FS} + \texttt{CONFIG\_NET\_9P\_VIRTIO}, \texttt{CONFIG\_VIRTIO\_BLK},
+\texttt{CONFIG\_MODULES} + \texttt{CONFIG\_MODULE\_UNLOAD}.
+
+Turn KASAN and lockdep on from day one. They cost boot speed and find bugs that would
+otherwise cost you days.
+
+\hypertarget{debugging}{%
+\subsection{Debugging}\label{debugging}}
+
+Add \texttt{-s\ -S} to make QEMU wait for a debugger on port 1234, then from the kernel source
+tree: \texttt{gdb\ vmlinux}, \texttt{target\ remote\ :1234}, and \texttt{lx-symbols} (from \texttt{CONFIG\_GDB\_SCRIPTS})
+to load your module's symbols automatically. You get breakpoints inside your own
+filesystem code, in a running kernel.
+
+\texttt{qemu/run.sh} should encapsulate all of the above. One command. If booting the VM has
+friction, you will avoid testing, and this project punishes that.
+
+\begin{center}\rule{0.5\linewidth}{0.5pt}\end{center}
+
+\hypertarget{testing}{%
+\section{Testing}\label{testing}}
+
+Four tiers. Each one catches a class of bug the others structurally cannot.
+
+\textbf{1. Unit tests on \texttt{core/} (userspace, valgrind).} Insert 10,000 random keys, verify
+sorted iteration returns all of them. Delete half, verify the rest survive. Force splits at
+every position in a leaf. This tier should be the majority of your test code, because
+\texttt{core/} is the majority of your logic.
+
+\textbf{2. Image tests.} \texttt{mkfs} → run a scripted mutation → \texttt{bitter-dump} → diff against a
+golden output. These catch on-disk format regressions, which are otherwise invisible until
+they're catastrophic.
+
+\textbf{3. \texttt{bitter-fsck} as an assertion, not a repair tool.} Run it after every test. It should
+verify: every checksum matches; every block's \texttt{bytenr} matches where it was found; the tree
+is sorted and balanced; \textbf{every extent's refcount equals the number of references actually
+found by walking every tree}; no allocated range overlaps another. That last pair is
+where the genuinely frightening bugs live.
+
+\textbf{4. Crash tests in QEMU.} The reason CoW exists.
+
+\begin{verbatim}
+boot VM → mount → start a write workload → SIGKILL qemu mid-transaction
+        → reboot → mount → fsck → verify the FS is at transaction N or N+1, never between
+\end{verbatim}
+
+Script this and run it in a loop overnight. Then, once it passes, \textbf{deliberately delete
+the flush in step 3 of §5 and confirm the test starts failing.} If it doesn't, your crash
+test isn't testing anything, and you'd rather learn that now.
+
+\textbf{Later:} \texttt{fsstress} and \texttt{fsx} (from xfstests) for concurrent and pathological
+workloads, then the xfstests \texttt{generic/} subset --- the same suite the real filesystems are
+held to.
+
+\begin{center}\rule{0.5\linewidth}{0.5pt}\end{center}
+
+\hypertarget{phases}{%
+\section{Phases}\label{phases}}
+
+Each phase has a definition of done. Don't move on without it.
+
+\begin{longtable}[]{@{}
+  >{\raggedright\arraybackslash}p{(\columnwidth - 4\tabcolsep) * \real{0.3333}}
+  >{\raggedright\arraybackslash}p{(\columnwidth - 4\tabcolsep) * \real{0.3333}}
+  >{\raggedright\arraybackslash}p{(\columnwidth - 4\tabcolsep) * \real{0.3333}}@{}}
+\toprule\noalign{}
+\begin{minipage}[b]{\linewidth}\raggedright
+\#
+\end{minipage} & \begin{minipage}[b]{\linewidth}\raggedright
+Phase
+\end{minipage} & \begin{minipage}[b]{\linewidth}\raggedright
+Done when
+\end{minipage} \\
+\midrule\noalign{}
+\endhead
+\bottomrule\noalign{}
+\endlastfoot
+\textbf{0} & \textbf{QEMU dev loop} & \texttt{qemu/run.sh} boots the guest, mounts the 9p share, and \texttt{insmod}s a hello-world module that only prints to \texttt{dmesg}. No filesystem code yet. \\
+\textbf{1} & \textbf{Format + tools} & \texttt{docs/ONDISK.md} is written; \texttt{mkfs.bitterfs} produces an image; \texttt{bitter-dump} prints its superblock and empty root tree. \\
+\textbf{2} & \textbf{B-tree in userspace} & Search/insert/delete/split pass randomized unit tests under valgrind. \textbf{No CoW yet} --- modify in place. \\
+\textbf{3} & \textbf{CoW + transactions} & \texttt{btree\_cow\_block} works; the commit protocol of §5 is implemented; the crash test of §8 passes in userspace. Generations increment. \\
+\textbf{4} & \textbf{Extent tree} & Allocation and refcounting work; \texttt{bitter-fsck} verifies refcounts against a full tree walk; the free-space map rebuilds at mount. \\
+\textbf{5} & \textbf{Mount, read-only} & The module mounts a real image in QEMU. \texttt{ls\ /mnt} works on a \texttt{mkfs}-created directory tree. \texttt{lookup}, \texttt{iterate\_shared}, \texttt{iget}, \texttt{statfs}. \\
+\textbf{6} & \textbf{File reads} & \texttt{cat} returns correct bytes. Extent lookup, \texttt{read\_folio}, sparse-file holes. \\
+\textbf{7} & \textbf{File writes} & \texttt{create}, \texttt{write}, \texttt{unlink}, \texttt{mkdir}, \texttt{truncate}. Data extents are CoW'd.~\texttt{fsync} forces a commit. This is the largest phase --- expect it to take longer than 5 and 6 combined. \\
+\textbf{8} & \textbf{Snapshots} & An ioctl creates a snapshot; writing to the original leaves the snapshot's contents untouched. Verified by diffing both trees after a mutation. \\
+\textbf{9} & \textbf{Crash consistency in the VM} & The §8 tier-4 loop passes over hundreds of iterations against a real virtio device. \\
+\textbf{10} & \textbf{Extras} & Pick from: reflink (\texttt{FICLONERANGE} / \texttt{remap\_file\_range}), snapshot \emph{deletion} (harder than creation --- recursive ref-drop), checksum verification on read, compression, \texttt{xfstests}, defrag. \\
+\end{longtable}
+
+Phase 8 is the payoff. If snapshots turn out to be nearly trivial to implement, the CoW
+and refcounting in phases 3 and 4 were done right. If they're hard, that's the signal
+that something upstream needs revisiting --- trust it.
+
+\hypertarget{phases-in-detail}{%
+\subsection{Phases in detail}\label{phases-in-detail}}
+
+The table gives the exit criterion. What follows is what each phase actually
+costs: which files it creates, which decisions it forces you to make, and what
+is hard about it. Phases marked \textbf{done} record what was learned rather
+than what was planned.
+
+\subsubsection{Phase 0 --- QEMU dev loop \textnormal{(done)}}
+
+\textbf{Produces} \texttt{qemu/kernel.config}, \texttt{mkinitramfs.sh},
+\texttt{init}, \texttt{run.sh}, \texttt{guest.sh}, and \texttt{kernel/}'s
+\texttt{Kbuild} plus wrapper Makefile and a hello-world module.
+
+Almost none of the work is filesystem work, which is the point: when phase 5
+goes wrong you want to already know the loop is sound, so the search space is
+your code and not the plumbing.
+
+\textbf{Three things this phase teaches the hard way.} The guest kernel must be
+built with \texttt{modules} and not only \texttt{bzImage} --- the former is what
+generates \texttt{Module.symvers}, without which modpost fails on undefined
+symbols that have nothing to do with your module. Kbuild reads a file named
+\texttt{Kbuild} in preference to \texttt{Makefile}, and with neither providing
+\texttt{obj-m} it builds nothing and exits zero, which looks exactly like
+success. And an out-of-tree module always sets \texttt{TAINT\_OOT\_MODULE}, so
+a smoke test asserting an untainted kernel fails forever.
+
+\subsubsection{Phase 1 --- Format and tools \textnormal{(done)}}
+
+\textbf{Produces} \texttt{format/bitterfs\_format.h},
+\texttt{core/bitter\_endian.h}, \texttt{core/bitter\_crc32c.\{c,h\}} with its
+generated table, and the two tools with their shared \texttt{util}/\texttt{print}
+support.
+
+\textbf{Decisions this phase forces, all permanent.} Which checksum, and over
+which byte range --- and the answer differs between the superblock (32..512,
+because that is the sector the drive writes atomically) and a tree block
+(32..4096, because a leaf's items fill it). What \texttt{generation} starts at:
+1, not 0, so that 0 can keep meaning "no transaction ever wrote this". Whether
+the crc32c table is a literal, computed at init, or generated at build time.
+And the numeric values of every item type and reserved objectid, which cannot
+change afterwards without invalidating every image ever made.
+
+Write the on-disk documentation \emph{before} the code. A format you cannot
+describe in prose you cannot debug at 2am.
+
+\subsubsection{Phase 2 --- B-tree in userspace}
+
+\textbf{Produces} \texttt{core/items.\{c,h\}}, \texttt{core/btree.\{c,h\}},
+\texttt{user/env\_user.\{c,h\}}, and the first entries in \texttt{tests/unit/}.
+
+\textbf{The seam stops being optional here.} Phases 0 and 1 got away with
+direct \texttt{pread} and \texttt{pwrite} because \texttt{mkfs} and
+\texttt{bitter-dump} are ordinary programs. The moment tree code lives in
+\texttt{core/}, it needs blocks and cannot call libc for them.
+
+\textbf{What is hard} is not the B-tree --- it is the two-ended leaf. Item
+descriptors grow forward while payloads stack backward, so an insert in the
+middle has to move both regions and rewrite every following descriptor's
+offset. Off-by-one there produces a leaf that reads as plausible garbage rather
+than failing, which is why the randomized tests matter more than the code does.
+Splitting is the second hard part, and it is where a search that must split
+discovers it needed to hold a write lock further up --- an ordering problem
+that only exists once phase 5 adds concurrency, but whose shape is set here.
+
+\textbf{No copy-on-write yet.} Modify in place. Adding CoW to a B-tree that
+already works is a contained change; debugging both at once is not.
+
+\subsubsection{Phase 3 --- CoW and transactions}
+
+\textbf{Produces} \texttt{core/cow.\{c,h\}} and \texttt{core/trans.\{c,h\}}, and
+adds \texttt{writeback\_all} and \texttt{flush\_device} to the seam.
+
+The whole phase turns on one comparison: a block whose \texttt{generation}
+equals the current transaction is already ours and may be modified in place,
+while an older one must be copied first. That single test is the copy-on-write
+decision, and every subtlety in this phase is a consequence of it.
+
+\textbf{What is hard} is ordering. Everything the new tree points at must be
+durable before the superblock that points at the new tree, and "durable" means
+a device flush and not merely a completed write. Get it wrong and the
+filesystem works perfectly until the first power cut. The crash test is
+therefore not optional --- it is the only thing that distinguishes a correct
+commit protocol from a plausible one.
+
+\subsubsection{Phase 4 --- Extent tree}
+
+\textbf{Produces} \texttt{core/extent.\{c,h\}} and \texttt{user/fsck.c}.
+
+Allocation and reference counting. Until now blocks have come from hardcoded
+addresses; from here an allocator hands them out and a refcount decides when
+one is free again.
+
+\textbf{What is hard} is the recursion: allocating a block requires modifying
+the extent tree, which requires copy-on-writing its blocks, which requires
+allocating blocks. btrfs breaks the cycle with delayed refs --- accumulating
+reference changes in memory and applying them at commit. Expect to discover
+this problem before you find that name for it.
+
+\texttt{bitter-fsck} earns its place here, because a refcount that drifts is
+invisible until a block is freed while still referenced, and by then the
+evidence is gone.
+
+\subsubsection{Phase 5 --- Mount, read-only}
+
+\textbf{Produces} \texttt{kernel/super.c}, \texttt{inode.c}, \texttt{dir.c}, and
+\texttt{kernel/env\_kernel.c}.
+
+The first time \texttt{core/} runs inside the kernel. If the seam was honest,
+this phase adds a second environment implementation and changes nothing above
+it.
+
+\textbf{What is hard} is that the feedback loop collapses. Everything
+\texttt{core/} got wrong that userspace tolerated --- a leaked buffer, a
+sleeping allocation under a lock, a stack array that was fine at 8 KB of
+userspace stack and is not at 8 KB of kernel stack --- now presents as a panic
+and a reboot. The VFS surface itself is mostly boilerplate; the difficulty is
+everything upstream arriving at once.
+
+This is also where the single mutex of §1.3 appears, and where lockdep starts
+having opinions.
+
+\subsubsection{Phase 6 --- File reads}
+
+\textbf{Produces} \texttt{kernel/file.c} and the
+\texttt{address\_space\_operations}.
+
+Extent lookup and \texttt{read\_folio}. The interesting case is the hole: a
+sparse file has ranges with no \texttt{EXTENT\_DATA} item at all, and the
+correct answer for those is zeroes rather than an error.
+
+\subsubsection{Phase 7 --- File writes}
+
+\textbf{Produces} the rest of \texttt{inode.c} and \texttt{file.c}:
+\texttt{create}, \texttt{write}, \texttt{unlink}, \texttt{mkdir},
+\texttt{truncate}, \texttt{fsync}.
+
+\textbf{The largest phase} --- expect it to exceed 5 and 6 combined. It is
+where the page cache and copy-on-write collide, because the page cache is built
+around a page having one stable disk address and CoW moves it on every write.
+
+\subsubsection{Phase 8 --- Snapshots}
+
+\textbf{Produces} \texttt{kernel/snapshot.c} and one ioctl.
+
+\textbf{The payoff, and the audit.} A snapshot is a second root item pointing at
+the same tree, with the root block's refcount incremented. If that turns out to
+be nearly trivial, phases 3 and 4 were done correctly. If it is hard, something
+upstream is wrong --- trust that signal rather than working around it.
+
+\subsubsection{Phase 9 --- Crash consistency in the VM}
+
+No new files. The phase 8 crash loop, run against a real virtio device for
+hundreds of iterations.
+
+\texttt{dm-log-writes} is the rigorous tool: it records every write and flush
+in order, so you can replay the device to any point and check that what you
+find is a filesystem that mounts. That is a stronger claim than "it survived
+the power cuts I happened to test".
+
+\subsubsection{Phase 10 --- Extras}
+
+Reflink (\texttt{FICLONERANGE}), snapshot \emph{deletion} (much harder than
+creation --- a recursive reference drop), checksum verification on read,
+compression, \texttt{xfstests}, defragmentation, and finer-grained locking than
+the single mutex.
+
+Pick by what you want to learn. Nothing here is load-bearing for the rest.
+
+\begin{center}\rule{0.5\linewidth}{0.5pt}\end{center}
+
+\hypertarget{known-hard-spots}{%
+\section{Known hard spots}\label{known-hard-spots}}
+
+Flagged in advance so you recognize them rather than discover them.
+
+\begin{enumerate}
+\def\labelenumi{\arabic{enumi}.}
+\tightlist
+\item
+  \textbf{Allocator recursion} (§4). Allocating requires updating the extent tree requires
+  allocating. The in-memory free-space map is the escape hatch.
+\item
+  \textbf{Leaf splitting with variable-sized items.} Not a midpoint index --- a size-based
+  decision, with the possibility that a single item is too large to fit anywhere.
+\item
+  \textbf{The flush barriers} (§5). Invisible until power loss. Test for their absence.
+\item
+  \textbf{CoW vs.~the generic page-cache helpers} (§6). Structural, not a bug. Plan the write
+  path around it.
+\item
+  \textbf{Refcount off-by-one.} Silent, delayed, catastrophic. \texttt{bitter-fsck} is the defense.
+\item
+  \textbf{Locking.} Deferred through phase 7, then unavoidable. Real btrfs uses per-block
+  read/write locks with careful path-acquisition ordering. Start with one filesystem-wide
+  mutex, get it correct, and let lockdep guide the refinement. A single big lock that
+  works beats fine-grained locking that deadlocks.
+\item
+  \textbf{Snapshot deletion.} Creation is twenty lines; deletion is a recursive walk dropping
+  a reference on every block, freeing only those that reach zero, and it must be
+  restartable across a crash. Treat it as its own phase.
+\item
+  \textbf{Kernel API churn} (§6). Pin a version.
+\end{enumerate}
+
+\begin{center}\rule{0.5\linewidth}{0.5pt}\end{center}
+
+\hypertarget{reading-list}{%
+\section{Reading list}\label{reading-list}}
+
+\textbf{Primary sources.} Ohad Rodeh, \emph{``B-trees, Shadowing, and Clones''}~\cite{Rodeh_2008}
+--- the paper btrfs's design comes from, and the source of the refcounting scheme in §4. Read it
+before phase 3. The later btrfs paper~\cite{Rodeh_2013} is the same ideas as shipped, and is the
+shorter read. Chris Mason's original btrfs design notes. The btrfs on-disk format
+documentation~\cite{btrfs_docs}.
+
+\textbf{Code.} \texttt{fs/btrfs/ctree.c} in the kernel tree --- \texttt{btrfs\_search\_slot} and
+\texttt{btrfs\_cow\_block} are the functions you are reimplementing; read them once early and again
+after your own version works. \texttt{btrfs-progs} for the userspace/kernel code-sharing pattern
+of §1. \texttt{sysprog21/simplefs} for a minimal disk-backed kernel module, which is the clearest
+model for phase 5.
+
+\textbf{Checksums (phase 1).} Ross Williams, \emph{``A Painless Guide to CRC Error Detection
+Algorithms''}~\cite{Williams_1993} --- an hour of plain text, and the only CRC tutorial worth
+reading. It derives the algorithm from polynomial division rather than asserting it, and it is the
+place to understand \emph{reflection}: why the constant you type is \texttt{0x82F63B78} rather than
+the \texttt{0x1EDC6F41} everyone quotes, and why the shift goes right. Those two choices are
+invisible in finished code, so without this the implementation is a magic number and a coin flip.
+Williams also introduces the Rocksoft parameter model that pins a CRC exactly, which is what Greg
+Cook's catalogue~\cite{crc_catalogue} then tabulates --- look up \textbf{CRC-32/ISCSI}, since
+``CRC-32'' alone names about twenty different algorithms and that ambiguity is why a correct
+crc32c disagrees with \texttt{cksum}, \texttt{zlib} and \texttt{gzip}. For implementation
+strategies once the theory is in place, Stephan Brumme compares bitwise, table-driven and
+slicing-by-8 side by side~\cite{brumme_crc32}, and the kernel's own
+\texttt{lib/gen\_crc32table.c} shows a third option: generating the table at build time rather
+than at init. Optional background: Castagnoli's paper~\cite{Castagnoli_1993} on why this
+polynomial was chosen, and RFC 3720~\cite{rfc3720}, which standardised it for iSCSI and gave it
+the catalogue name.
+
+\textbf{Kernel.} \texttt{Documentation/filesystems/vfs.rst} (the contract),
+\texttt{Documentation/filesystems/porting.rst} (the churn), and --- since you've already read xv6's
+\texttt{namex} and \texttt{bmap} --- note that \texttt{bitterfs\_lookup\_extent} is what \texttt{bmap} becomes when block
+pointers give way to extents.
+
+\begin{center}\rule{0.5\linewidth}{0.5pt}\end{center}
+
+\hypertarget{consolidation-questions}{%
+\section{Consolidation questions}\label{consolidation-questions}}
+
+In the style of the roadmap. Revisit at each phase.
+
+\begin{itemize}
+\tightlist
+\item
+  Where did the answer to ``\emph{what happens if the machine crashes between the journal commit
+  and the checkpoint?}'' go? Why does the question stop making sense here?
+\item
+  CoW never overwrites live data, so why does bitterfs still need a device flush?
+\item
+  What does CoW cost that journaling doesn't? (Consider: a one-byte write to a file inside
+  a deep directory tree. How many blocks are written?)
+\item
+  Why is a snapshot O(1) to create but not O(1) to delete?
+\item
+  If an extent is shared by two snapshots and one of them overwrites the middle 4KiB of it,
+  what happens to the other 99\% of the extent? Which \texttt{EXTENT\_DATA} field makes the answer
+  efficient rather than ``copy the whole thing''?
+\item
+  Why does fragmentation hurt CoW filesystems more than in-place ones? What is \texttt{balance}
+  actually for?
+\item
+  Your \texttt{bitter\_env} seam exists to keep \texttt{core/} out of the kernel. What did that cost you
+  in the kernel implementation?
+\end{itemize}

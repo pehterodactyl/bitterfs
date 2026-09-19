@@ -1,0 +1,158 @@
+% ===========================================================================
+% preamble.tex — shared packages, styles and macros for the bitterfs docs
+% ===========================================================================
+%
+% Engine: lualatex.  Chosen for native UTF-8 and real system fonts, because
+% these documents are full of em-dashes, arrows and box-drawing characters that
+% pdflatex would need escaping for.
+%
+% Build with:  make -C docs
+% ===========================================================================
+
+% --- Page and fonts --------------------------------------------------------
+\usepackage{geometry}
+\geometry{a4paper, margin=2.5cm}
+
+% fontspec needs lualatex or xelatex.  Latin Modern is the TeX default and is
+% always present; DejaVu Sans Mono is chosen for code specifically because of
+% its wide glyph coverage — box-drawing characters and arrows appear inside
+% verbatim blocks throughout these documents.
+\usepackage{fontspec}
+\setmainfont{Latin Modern Roman}
+\setsansfont{DejaVu Sans}[Scale=MatchLowercase]
+\setmonofont{DejaVu Sans Mono}[Scale=MatchLowercase]
+
+\usepackage{microtype}
+
+% --- Tables ----------------------------------------------------------------
+\usepackage{booktabs}   % \toprule/\midrule/\bottomrule — no vertical rules
+\usepackage{longtable}  % tables that break across pages (pandoc emits these)
+\usepackage{array}
+\usepackage{multirow}
+
+% --- Lists, colour, captions -----------------------------------------------
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage[font=small,labelfont=bf]{caption}
+
+% --- Diagrams --------------------------------------------------------------
+% bytefield draws on-disk structure layouts with byte/bit offset rulers.  This
+% is the package that makes LaTeX worth the trouble for a format specification:
+% \wordbox and \bitbox produce a real diagram of a struct rather than ASCII art.
+\usepackage{bytefield}
+
+% tikz for everything bytefield does not cover — chiefly the leaf layout, where
+% items grow forward from the header while payloads stack backward from the end
+% of the block.
+\usepackage{tikz}
+\usetikzlibrary{positioning, arrows.meta, fit, backgrounds, calc, shapes.multipart}
+
+% --- Code listings ---------------------------------------------------------
+\usepackage{listings}
+
+\definecolor{codekw}{HTML}{0B5FA5}
+\definecolor{codecm}{HTML}{6A737D}
+\definecolor{codestr}{HTML}{A31515}
+\definecolor{codeframe}{HTML}{C8C8C8}
+\definecolor{codebg}{HTML}{FAFAFA}
+
+% listings processes input character by character, so multi-byte UTF-8 breaks
+% it even under lualatex.  The `literate` table below maps each character that
+% actually appears in these documents to something typesettable.  Add to it
+% rather than removing the character from the source — the source is also read
+% as plain text in a terminal, where the box drawing is the point.
+\lstset{
+  basicstyle=\ttfamily\small,
+  keywordstyle=\color{codekw}\bfseries,
+  commentstyle=\color{codecm}\itshape,
+  stringstyle=\color{codestr},
+  numberstyle=\tiny\color{codecm},
+  backgroundcolor=\color{codebg},
+  frame=single,
+  rulecolor=\color{codeframe},
+  framesep=4pt,
+  breaklines=true,
+  breakatwhitespace=true,
+  showstringspaces=false,
+  columns=fullflexible,
+  keepspaces=true,
+  upquote=true,
+  extendedchars=true,
+  literate=
+    {─}{{-}}1 {│}{{|}}1 {┌}{{+}}1 {┐}{{+}}1
+    {└}{{+}}1 {┘}{{+}}1 {├}{{+}}1 {┤}{{+}}1 {┬}{{+}}1 {┴}{{+}}1 {┼}{{+}}1
+    {→}{{$\rightarrow$}}1 {←}{{$\leftarrow$}}1
+    {↑}{{$\uparrow$}}1    {↓}{{$\downarrow$}}1
+    {≤}{{$\leq$}}1        {≥}{{$\geq$}}1  {≈}{{$\approx$}}1
+    {×}{{$\times$}}1      {—}{{---}}1     {–}{{--}}1
+    {“}{{``}}1            {”}{{''}}1      {‘}{{`}}1  {’}{{'}}1
+    {…}{{\ldots}}1        {·}{{$\cdot$}}1
+}
+
+% Styles are DEFINED here but no global default language is set.  An earlier
+% version made C the default, which meant every ASCII diagram containing the
+% word "struct" got it bold-blued.  Ask for the style you want:
+%     \begin{lstlisting}[style=c]
+\lstdefinestyle{c}{language=C}
+
+% Shell transcripts and hexdumps: no keyword highlighting, since C keywords
+% appearing in a shell command would be coloured misleadingly.
+\lstdefinestyle{shell}{language=,keywordstyle=,basicstyle=\ttfamily\small}
+
+% --- Code blocks in CONVERTED documents ------------------------------------
+% pandoc emits Shaded/Highlighting rather than lstlisting.  That is the better
+% path for these documents and the reason listings is not used globally:
+% Highlighting is built on fancyvrb, which under lualatex passes UTF-8 straight
+% through, so the box-drawing characters in the architecture diagrams survive.
+% listings processes input one character at a time and mangles them.
+\usepackage{framed}
+\definecolor{shadecolor}{HTML}{FAFAFA}
+\input{pandoc-highlight}
+\renewenvironment{Shaded}{\begin{snugshade}}{\end{snugshade}}
+
+% --- pandoc compatibility --------------------------------------------------
+% pandoc's LaTeX writer emits \tightlist for lists without blank lines between
+% items, and \passthrough around inline code in some contexts.  Neither is
+% defined by any package, so converted documents fail to build without them.
+\providecommand{\tightlist}{%
+  \setlength{\itemsep}{0pt}\setlength{\parskip}{0pt}}
+\providecommand{\passthrough}[1]{#1}
+
+% --- Cross-references ------------------------------------------------------
+% hyperref must come late; cleveref must come after hyperref.
+\usepackage[hidelinks, bookmarksnumbered]{hyperref}
+\usepackage{cleveref}
+
+\usepackage[backend=biber, style=numeric, sorting=none]{biblatex}
+\addbibresource{refs.bib}
+
+
+% --- Project macros --------------------------------------------------------
+% Consistent typesetting for the things these documents name constantly.  Using
+% a macro rather than \texttt directly means the styling is changeable in one
+% place, and it documents intent: \key{} is a key, not just monospace text.
+\newcommand{\code}[1]{\texttt{#1}}
+\newcommand{\fnname}[1]{\texttt{#1}}                       % a function
+\newcommand{\field}[1]{\texttt{#1}}                        % a struct field
+\newcommand{\itemtype}[1]{\textsc{\MakeLowercase{#1}}}     % INODE_ITEM etc.
+
+% A (objectid, type, offset) key, typeset consistently.
+% \mbox rather than \text: \text needs amsmath, which is not loaded, and this
+% macro went unused for long enough that nobody noticed it could not compile.
+\newcommand{\keytriple}[3]{\ensuremath{(\mbox{\code{#1}},\,\mbox{\code{#2}},\,\mbox{\code{#3}})}}
+
+% Byte-count shorthand used throughout the format spec.
+\newcommand{\bytes}[1]{#1\,B}
+\newcommand{\kib}[1]{#1\,KiB}
+\newcommand{\mib}[1]{#1\,MiB}
+
+% An open decision, called out visibly in the rendered PDF.  A format spec with
+% unresolved choices buried in prose is a format spec you will implement twice;
+% these boxes are meant to be impossible to skim past, and to disappear as they
+% are settled.
+\newcommand{\decide}[1]{%
+  \par\medskip\noindent
+  \fcolorbox{black!30}{yellow!12}{%
+    \parbox{\dimexpr\linewidth-2\fboxsep-2\fboxrule}{%
+      \textbf{Decide:}\ #1}}%
+  \par\medskip}

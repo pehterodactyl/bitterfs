@@ -1,0 +1,192 @@
+\chapter{Files and directories}
+\label{ch:files}
+
+Phase~5 ended with a mount that reached \code{core/} and refused: the on-disk
+format had a root tree and an extent tree and no third thing, so there was no
+root directory to build an inode from. This chapter is the third tree, and what
+it takes to read a file out of it.
+
+The work divides oddly. Three \emph{format} decisions --- how a directory entry
+is keyed, what an inode records, how a file's bytes are described --- carry
+almost all the weight, because each is unchangeable once \fnname{mkfs} has
+written one. The kernel code that consumes them is mostly borrowed: the page
+cache, the dentry cache and the \code{getdents} machinery are the VFS's, and
+what bitterfs supplies is a few hundred lines that answer questions about keys.
+
+\section{The FS tree}
+
+One tree holds the entire namespace. Five item types live in it, and the
+key-type numbering in \code{format/bitterfs\_format.h} \emph{is} their sort
+order:
+
+\begin{quote}
+\itemtype{INODE\_ITEM} 1, \itemtype{INODE\_REF} 25, \itemtype{DIR\_ITEM} 48,
+\itemtype{DIR\_INDEX} 72, \itemtype{EXTENT\_DATA} 96
+\end{quote}
+
+Keys sort \keytriple{objectid}{type}{offset}, so everything about one object is
+contiguous, its inode first and its data map last. Two properties follow, and
+both were designed for rather than discovered.
+
+\paragraph{An object's items are a range.} Deleting a file is a scan from
+\keytriple{N}{0}{0} to \keytriple{N}{255}{-1}, which is what
+\code{BITTER\_KEY\_TYPE\_MAX} exists to bound. Truncating one is the same scan
+restricted to \itemtype{EXTENT\_DATA}, and it is contiguous because that type
+sorts last.
+
+\paragraph{A file and a directory differ only in which types appear.} Both are
+an objectid with an \itemtype{INODE\_ITEM}. A file has \itemtype{EXTENT\_DATA}
+items; a directory has \itemtype{DIR\_ITEM} and \itemtype{DIR\_INDEX} ones. The
+tree does not know or care which --- \field{mode} is what says. An FS tree
+containing nothing but \keytriple{256}{INODE\_ITEM}{0} is already a complete,
+valid, empty root directory, which is exactly what \fnname{mkfs} wrote first.
+
+\section{Two items per directory entry}
+
+Every entry is stored \emph{twice}, with identical payloads under two keys:
+
+\begin{quote}
+\keytriple{dir}{DIR\_ITEM}{hash(name)} \quad for lookup\\
+\keytriple{dir}{DIR\_INDEX}{seq} \quad for \fnname{readdir}
+\end{quote}
+
+Because two operations need opposite orderings and no single one serves both.
+Lookup has a name and wants one search, so the key must sort by name.
+\fnname{readdir} must be \emph{resumable} --- \code{getdents} hands userspace a
+cookie and continues later --- so it needs a stable monotonic ordering, which a
+hash cannot give: hashes collide, so the cookie would not be unique, and a
+newly created entry can land \emph{behind} the current position and never be
+returned.
+
+They are not interleaved. Type dominates offset, so a directory is one run of
+hash entries followed by one run of index entries, in different orders, and each
+operation walks only its own. A directory with $n$ entries is $1 + 2n$ items;
+create writes two, unlink removes two, rename touches four, and nothing yet
+checks that the two runs agree.
+
+\subsection{The index is a cookie, not a count}
+
+\field{next\_dir\_index} lives in the directory's own inode item and only ever
+rises. A directory that has had a thousand files created and deleted holds 1002
+and no entries.
+
+Monotonicity is the whole correctness argument: \fnname{readdir}'s
+\code{f\_pos} \emph{is} this number, so reusing a freed value would let a
+resumed enumeration miss an entry it never saw, or return one it already had.
+Gaps cost nothing --- a search for a deleted index returns the next real entry
+--- which is the same property that makes deletion-riddled directories walkable.
+
+It starts at 2, because \fnname{dir\_emit\_dots} consumes positions 0 and 1 for
+\code{.} and \code{..}. Those two are synthesised from the dentry tree and
+stored nowhere, which is also why the root directory has \field{nlink} 2 with an
+empty tree.
+
+\subsection{The hash, and the collision it guarantees}
+
+\itemtype{DIR\_ITEM}'s offset is CRC-32/ISCSI over the name bytes --- the same
+algorithm and the same parameters \code{bt\_block\_csum} uses for blocks, so a
+key can be checked by hand against any off-the-shelf implementation when a
+lookup misbehaves and the question is whether the key or the search is wrong.
+It is specified in the format header rather than left implicit in
+\code{core/dir.c}, because it is as much part of the on-disk format as any
+struct.
+
+Thirty-two bits of hash means a directory reaches even odds of \emph{some}
+collision at roughly 65{,}000 entries. That is not exotic, and it is why the
+name is in the payload at all: the key cannot distinguish colliding names, so
+\fnname{lookup} compares the stored name after finding the key.
+
+\decide{An item currently holds one entry, so a colliding pair cannot both be
+stored. \fnname{bitter\_dir\_item} does not foreclose the fix --- \field{name\_len}
+gives the stride and \field{bitter\_item.size} gives the end, so an item can hold
+a sequence --- but nothing implements it. Harmless while nothing creates files.
+See \code{docs/LOG.md}.}
+
+\section{The inode item}
+
+\bytes{112}, and the hardest struct in the project to change: every inode on
+disk carries it.
+
+It contains no inode number. The key's objectid \emph{is} the inode number, and
+storing it twice would create two values that can disagree --- a corruption
+\fnname{fsck} would then have to check for. The same rule explains why
+\code{bitter\_root\_item} has no objectid: the payload never repeats what the
+key already says.
+
+Two fields are conditionally valid and look universal. \field{rdev} means
+something only for \code{S\_ISCHR} and \code{S\_ISBLK}; \field{next\_dir\_index}
+only for directories. Both are zero otherwise, and both are read without
+checking \field{mode} by anyone who has not been told.
+
+\paragraph{And there are no block pointers.} A classic Unix inode \emph{is} its
+block map: direct pointers, then single, double and triple indirect. There is
+nothing like that here. A file's contents are separate
+\keytriple{ino}{EXTENT\_DATA}{file\_offset} items, and the B-tree supplies the
+indirection at whatever depth the file's size demands --- so there is no
+special case to write and no limit to grow out of. \field{size} and
+\field{nbytes} are \emph{summaries} of that map rather than the map, and the
+difference between them is exactly the holes.
+
+\section{Where a file's bytes are}
+
+Four numbers, in three coordinate systems, and none derivable from the others:
+
+\begin{quote}
+\field{disk\_bytenr} + \field{disk\_num\_bytes} --- the \emph{physical} extent\\
+\field{offset} + \field{num\_bytes} --- this file's \emph{window} into it\\
+the key's offset --- where that window lands \emph{in the file}
+\end{quote}
+
+\field{disk\_num\_bytes} must describe the whole extent rather than this file's
+share, because with \field{disk\_bytenr} it is the extent tree's key
+\keytriple{bytenr}{EXTENT\_ITEM}{length}; store the window and refcounting
+searches for a key that does not exist.
+
+\field{offset} is the one that looks redundant. Overwrite \kib{4} in the middle
+of a \mib{1} file: copy-on-write puts the new bytes elsewhere, and the file then
+needs three items, the first and third both naming the original extent at
+different offsets into it. Without the field the only way to express that is to
+split the extent physically --- a megabyte of I/O to change four kilobytes,
+which defeats the point of CoW entirely. It is the same mechanism that makes
+reflink possible.
+
+\subsection{Reading one}
+
+\fnname{bitterfs\_get\_block} answers one question: where does file block $n$
+live? The answer has two forms and neither is the return value --- a mapped
+buffer head, or an untouched one meaning \emph{hole}. The generic code
+zero-fills for the second, so the sparse case the skeleton called this phase's
+interesting one requires no code at all. It is the absence of an answer.
+
+The lookup is by \emph{containment}, not identity: the item covering an offset
+is the one with the largest key offset at or below it. A miss therefore steps
+back one slot --- and needs no backward walk, because
+\fnname{btree\_search}'s descent already steps to the child \emph{before} the
+first separator greater than the key, landing in the leaf that holds the
+predecessor even when that is a different leaf from the successor. Forward scans
+need \fnname{btree\_next\_leaf}; containment lookups do not.
+
+Everything above it is borrowed. \fnname{mpage\_read\_folio} owns the folio
+locking, the bio submission and the zero-filling; \fnname{bitterfs\_read\_folio}
+is one line.
+
+\decide{A data block is the only thing on the device nothing verifies --- no
+header, no checksum, no fsid. \fnname{get\_block} bounds and aligns the address
+it computes, which catches a wild value and nothing subtler. Data checksums are
+what \itemtype{EXTENT\_CSUM} is reserved for. See \code{docs/LOG.md}.}
+
+\section{What the tests assert}
+
+\code{qemu/guest.sh} grew from 15 checks to 36, and the ones with teeth are the
+values read back out of \fnname{stat}: inode 256 and 257, link counts, modes,
+and timestamps with nanoseconds intact. Each travelled from
+\fnname{format\_initial\_fs\_tree} through the on-disk item, through
+\fnname{read\_block}'s three checks, through byte-order conversion, into a
+\code{struct inode}. A wrong \fnname{offsetof} or a missed accessor shows up as
+a wrong number rather than as something that merely works.
+
+Two are worth naming. \code{wc -c} returning exactly 20 proves \field{i\_size}
+bounds the read and the \bytes{4076} of zero padding in the allocated block are
+not returned. And a missing name being \emph{absent} rather than an error proves
+\fnname{lookup} returns a negative dentry --- the distinction that decides
+whether phase~7's \code{open(O\_CREAT)} can work at all.

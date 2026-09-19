@@ -1,0 +1,405 @@
+\chapter{On-disk format}
+\label{ch:ondisk}
+
+\section{0: Purpose}
+This document defines the byte-level contract shared by mkfs, bitter-dump, bitter-fsck, an the kernel module.
+\lstinline|format/bitterfs_format.h| is authorative and will be explained in this document. 
+\section{1: Disk Format and Conventions}
+\bf{This section outlines the formatting and conventions that will be used in this file system}
+Byte order is little endian, with \lstinline|__le32/__le64| on disk. 
+Accessors will be used to convert that format to the 
+host CPU's byte order.
+Block size is 4096 a common standard across FS design
+Addressing happens with byte offsets("bytenr") which are always a multiple of 4096
+checksum 32 byte field; crc32c in the first 4 bytes, rest zero
+checksum covers every after the checksum field to the end of the block
+\section{2: Layout map}
+\bf{Outlines the byte add}
+0x00000 is reserved 64 KiB, that must remain untouched
+0x10000 is a superblock, it is the only fixed block in the entire file system
+0x11000 is the initial address of the rootnode
+0x12000 is the first free block set at initialization
+Everything past this point is free
+\section{3: Objectid map}
+
+
+Object ids are 64-bit and mostly assigned freely to files and directories, but
+both ends of the range are reserved. Reservations cannot be added later without
+renumbering every image ever made, which is why they are settled before
+\texttt{mkfs} exists.
+
+\begin{center}
+\begin{tabular}{llp{7.6cm}}
+  \toprule
+  Value & Name & Meaning \\
+  \midrule
+  0     & \texttt{INVALID}     & Never assigned, so that an all-zero key is recognisably invalid \\
+  1     & \texttt{ROOT\_TREE}   & The tree of tree roots, located via \texttt{super.root} \\
+  2     & \texttt{EXTENT\_TREE} & Allocation records and reference counts \\
+  4     & \texttt{FS\_TREE}     & Inodes, directory entries and extent maps \\
+  256   & \texttt{FIRST\_FREE}  & First id available to files and directories \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\decide{The top of the object id space is not yet reserved. btrfs keeps the
+region at \texttt{-256} and above for special objects. Reserving it costs
+nothing now and is impossible later.}
+
+\section{Item types}
+\label{sec:item-types}
+
+The \texttt{type} byte does two jobs: it says how to interpret the payload, and
+it says what the key's \texttt{offset} field means.
+
+\begin{center}
+\begin{tabular}{llll}
+  \toprule
+  Value & Name & \texttt{objectid} holds & \texttt{offset} holds \\
+  \midrule
+  1   & \texttt{INODE\_ITEM}   & inode number  & 0, unused \\
+  25  & \texttt{INODE\_REF}    & inode number  & the parent's inode number \\
+  48  & \texttt{DIR\_ITEM}     & parent inode  & hash of the entry's name \\
+  72  & \texttt{DIR\_INDEX}    & parent inode  & per-directory sequence number \\
+  96  & \texttt{EXTENT\_DATA}  & inode number  & offset within the file \\
+  120 & \texttt{EXTENT\_ITEM}  & disk address  & length of the extent \\
+  255 & \texttt{KEY\_TYPE\_MAX} & \multicolumn{2}{l}{reserved sentinel, never a real type} \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Why these numbers}
+
+The values are not labels. Keys sort by \texttt{objectid}, then \texttt{type},
+then \texttt{offset}, so \textbf{the numeric order of these constants is the
+physical order items appear on disk} for a given object. Only the relative
+order carries design information: renumbering everything consistently would
+change nothing, but swapping two values changes the layout.
+
+\texttt{INODE\_ITEM} is 1 so an object's inode is always the first item in its
+range, which any lookup reaches immediately. \texttt{EXTENT\_DATA} is last of
+the file types because a large file has thousands of them, and that bulk
+belongs at the end of the range rather than between the inode and its directory
+entries. It also makes \texttt{truncate} a single contiguous range delete that
+runs to the end of the object's keys with nothing after it to preserve.
+
+The gaps are insertion room. A type added later --- \texttt{EXTENT\_CSUM} for
+data checksums, or \texttt{XATTR\_ITEM} --- must be able to land at the correct
+\emph{sort position} without renumbering anything already on disk.
+
+\subsection{The sentinel}
+
+255 is reserved because range scans need an upper bound that sorts after every
+genuine item. To visit everything belonging to object $N$, scan from
+\texttt{(N, 0, 0)} to \texttt{(N, 255, (bt\_le64)-1)}. Were 255 assignable, the
+last item of that type would fall outside the range and \texttt{unlink} would
+leak it.
+
+\section{Structures}
+\label{sec:structures}
+
+Offsets below are read from the compiled header rather than computed by hand,
+so this table and the code cannot disagree. Every structure is packed: padding
+is explicit and named, never compiler-inserted.
+
+\subsection{\texttt{bitter\_key}}
+
+\begin{center}
+\begin{bytefield}[bitwidth=3.1em]{8}
+  \bitheader{0-7} \\
+  \wordbox{1}{objectid \hfill \texttt{bt\_le64}} \\
+  \bitbox{1}{type} & \bitbox{7}{offset (bytes 0--6)} \\
+  \bitbox{1}{\dots} & \bitbox{7}{\emph{next structure begins here}} \\
+\end{bytefield}
+\end{center}
+
+\begin{center}
+\begin{tabular}{rrll}
+  \toprule
+  Offset & Size & Type & Field \\
+  \midrule
+  0 & 8 & \texttt{bt\_le64} & \texttt{objectid} \\
+  8 & 1 & \texttt{bt\_u8}   & \texttt{type} \\
+  9 & 8 & \texttt{bt\_le64} & \texttt{offset} \\
+  \midrule
+  \multicolumn{2}{r}{\textbf{17}} & & \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+Seventeen bytes, deliberately not a multiple of anything. The diagram above
+makes the consequence visible: the second key in an array starts one byte into
+a row. That is the price of packing, and it is worth paying --- the layout is
+then identical on every target, with no compiler free to insert padding of its
+own choosing.
+
+Note that \texttt{type} is \texttt{bt\_u8} rather than a little-endian type. A
+single byte has no byte order, so it needs no conversion and no marking.
+
+\subsection{\texttt{bitter\_header}}
+
+Begins every tree block, internal node and leaf alike.
+
+\begin{center}
+\begin{tabular}{rrllp{6.2cm}}
+  \toprule
+  Offset & Size & Type & Field & Purpose \\
+  \midrule
+  0  & 32 & \texttt{bt\_u8[]}  & \texttt{csum}       & crc32c in bytes 0--3, rest zero; covers everything after this field \\
+  32 & 16 & \texttt{bt\_u8[]}  & \texttt{fsid}       & must equal the superblock's \\
+  48 & 8  & \texttt{bt\_le64}  & \texttt{bytenr}     & this block's own address \\
+  56 & 8  & \texttt{bt\_le64}  & \texttt{generation} & the transaction that wrote it \\
+  64 & 8  & \texttt{bt\_le64}  & \texttt{owner}      & which tree this block belongs to \\
+  72 & 4  & \texttt{bt\_le32}  & \texttt{nritems}    & items in a leaf, children in a node \\
+  76 & 1  & \texttt{bt\_u8}    & \texttt{level}      & 0 means leaf \\
+  77 & 19 & \texttt{bt\_u8[]}  & \texttt{reserved}   & zero on write \\
+  \midrule
+  \multicolumn{2}{r}{\textbf{96}} & & & \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{Three fields make a block self-identifying.} \texttt{csum} proves the
+contents are intact; \texttt{fsid} proves the block belongs to \emph{this}
+filesystem; \texttt{bytenr} proves it was found where it claims to live. The
+last two catch what a checksum structurally cannot --- a stale block from a
+previous \texttt{mkfs}, or a misdirected write. Both checksum perfectly,
+because both were once valid blocks of something else.
+
+\texttt{owner} closes the remaining gap: a block that is intact, in the right
+place, and belongs to this filesystem, but is claimed by the wrong tree.
+
+\paragraph{\texttt{generation} is the copy-on-write witness.} A block whose
+generation equals the current transaction is already ours and may be modified
+in place; anything older must be copied first. That single comparison is the
+entire CoW decision.
+
+\paragraph{Why 96 and not 77.} A multiple of 16, so structures align with
+hexdump rows, and it leaves the leaf data area at exactly 4000 bytes --- which
+makes capacity arithmetic something that can be done in the head while
+debugging. btrfs by contrast uses an unpadded 101-byte header, and every
+hexdump of a btrfs leaf is correspondingly awkward to read.
+
+\subsection{\texttt{bitter\_key\_ptr}}
+
+An entry in an internal node.
+
+\begin{center}
+\begin{tabular}{rrllp{6cm}}
+  \toprule
+  Offset & Size & Type & Field & Purpose \\
+  \midrule
+  0  & 17 & \texttt{bitter\_key} & \texttt{key}        & smallest key in the subtree below \\
+  17 & 8  & \texttt{bt\_le64}    & \texttt{blockptr}   & address of the child block \\
+  25 & 8  & \texttt{bt\_le64}    & \texttt{generation} & child's generation, cross-checked on read \\
+  \midrule
+  \multicolumn{2}{r}{\textbf{33}} & & & \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+At 33 bytes per entry a node holds $\lfloor 4000/33 \rfloor = 121$ children, so
+three levels address roughly $121^3 \approx 1.7$ million leaves. Tree depth
+grows slowly enough that 4096-byte nodes remain comfortable at this scale.
+
+\subsection{\texttt{bitter\_item}}
+
+An entry in a leaf.
+
+\begin{center}
+\begin{tabular}{rrllp{6cm}}
+  \toprule
+  Offset & Size & Type & Field & Purpose \\
+  \midrule
+  0  & 17 & \texttt{bitter\_key} & \texttt{key}    & \\
+  17 & 4  & \texttt{bt\_le32}    & \texttt{offset} & payload start, measured from the end of the header \\
+  21 & 4  & \texttt{bt\_le32}    & \texttt{size}   & payload length \\
+  \midrule
+  \multicolumn{2}{r}{\textbf{25}} & & & \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{Leaves grow from both ends.} These descriptors march forward from the
+header while the payloads they point at stack backward from the end of the
+block; the free space is the gap between. That is why \texttt{offset} is
+measured from the end of the header --- state the base explicitly, because both
+conventions exist and mixing them is a guaranteed bug.
+
+\decide{\texttt{offset} and \texttt{size} are 32 bits each, inherited from
+btrfs, which supports node sizes up to 64\,KiB. Both values are bounded by a
+4096-byte block here, so they need only 12 bits. \texttt{uint16\_t} would make
+the item 21 bytes instead of 25 --- about 19\% more items per leaf, and a
+correspondingly shallower tree. The argument for keeping 32 bits is that every
+intermediate in the leaf arithmetic is then obviously overflow-free, and that
+arithmetic is where the bugs live.}
+
+\subsection{\texttt{bitter\_root\_item}}
+
+Where a tree's root block currently lives. The payload of a
+\itemtype{ROOT\_ITEM}, stored under \keytriple{objectid}{ROOT\_ITEM}{0} in the
+root tree, one per tree.
+
+\begin{center}
+\begin{tabular}{rrllp{6cm}}
+  \toprule
+  Offset & Size & Type & Field & Purpose \\
+  \midrule
+  0  & 8 & \texttt{bt\_le64} & \texttt{bytenr}     & the tree's root block \\
+  8  & 8 & \texttt{bt\_le64} & \texttt{generation} & that block's generation \\
+  16 & 1 & \texttt{bt\_u8}   & \texttt{level}      & the tree's height \\
+  \midrule
+  \multicolumn{2}{r}{\textbf{17}} & & & \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{No \field{objectid}.} The key already carries it. Two copies could
+disagree, and the one nobody reads is the one that rots.
+
+\paragraph{The root tree has no root item.} It cannot: the item would have to
+live inside the tree it locates. Its address comes from \field{super.root} by
+fiat, and every other tree is found through it. That asymmetry is the only
+place in the format where a lookup bottoms out rather than recursing.
+
+\paragraph{\field{level} is duplicated} --- it is also in the root block's own
+header. A descent needs the depth \emph{before} the first read, which is the
+same argument that put \field{root\_level} in the superblock.
+
+\decide{\field{offset} in the key is 0 and means ``unused''. btrfs stores the
+creating transaction there, so a tree's roots sort in creation order and
+``find the newest'' is a backward scan from \code{(u64)-1}. Nothing needs that
+until snapshots exist. Whatever the field comes to mean, 0 must keep meaning
+the live root, because every image already written has a 0 in it.}
+
+\subsection{\texttt{bitter\_extent\_item}}
+
+How many references point at one extent. Stored under
+\keytriple{bytenr}{EXTENT\_ITEM}{length}.
+
+\begin{center}
+\begin{tabular}{rrllp{6cm}}
+  \toprule
+  Offset & Size & Type & Field & Purpose \\
+  \midrule
+  0 & 8 & \texttt{bt\_le64} & \texttt{refs}  & pointers at this extent \\
+  8 & 8 & \texttt{bt\_le64} & \texttt{flags} & what kind of extent it is \\
+  \midrule
+  \multicolumn{2}{r}{\textbf{16}} & & & \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\begin{center}
+\begin{tabular}{llp{7.5cm}}
+  \toprule
+  Bit & Name & Meaning \\
+  \midrule
+  0 & \code{BITTER\_EXTENT\_FLAG\_RESERVED} &
+      allocated and reachable from no tree: the reserved prefix and the
+      superblock \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{The key carries the identity.} The extent's start address is the
+objectid and its length is the offset, so the payload holds only what changes.
+One counted field is the whole structure for that reason, not for want of
+finishing it.
+
+\paragraph{An extent is free when it has \emph{no} item}, not when it has an
+item holding zero. The last reference deletes the item, so a stored 0 is
+corruption. This matters because free space is derived by subtraction: the gaps
+between items are what is available, and an item that lingered at zero would
+make free space look allocated forever.
+
+\paragraph{Address order is not an accident.} Keys sort
+$(\mbox{objectid},\,\mbox{type},\,\mbox{offset})$ and the objectid here \emph{is}
+an address, so every extent item in the filesystem sits in the tree in device
+order. Rebuilding the free-space map is therefore one linear walk with no
+sorting step --- see \cref{ch:extents}.
+
+\paragraph{Why \code{RESERVED} exists.} Without it, the 68\,KiB before the
+first tree block is an extent with one reference that nothing points at, which
+is indistinguishable from a leak. \fnname{bitter-fsck} would report it on every
+filesystem that has ever been created, and no repair could ever clear it.
+
+\decide{An unknown flag bit must be preserved rather than cleared, so a newer
+version's extents survive an older tool. Deliberately absent: \field{generation}
+(nothing reads it), and the tree-block-versus-file-data distinction, which waits
+for phase 7 to have data extents to distinguish.}
+
+\subsection{\texttt{bitter\_super}}
+
+\begin{center}
+\begin{tabular}{rrllp{5.4cm}}
+  \toprule
+  Offset & Size & Type & Field & Purpose \\
+  \midrule
+  0   & 32  & \texttt{bt\_u8[]} & \texttt{csum}            & covers everything after this field \\
+  32  & 16  & \texttt{bt\_u8[]} & \texttt{fsid}            & the filesystem's UUID \\
+  48  & 8   & \texttt{bt\_u8[]} & \texttt{magic}           & identifies the image as bitterfs \\
+  56  & 8   & \texttt{bt\_le64} & \texttt{bytenr}          & its own address, \texttt{0x10000} \\
+  64  & 8   & \texttt{bt\_le64} & \texttt{generation}      & the committed transaction number \\
+  72  & 8   & \texttt{bt\_le64} & \texttt{root}            & address of the root tree's root block \\
+  80  & 8   & \texttt{bt\_le64} & \texttt{total\_bytes}    & device size recorded at mkfs \\
+  88  & 8   & \texttt{bt\_le64} & \texttt{bytes\_used}     & allocated bytes, for \texttt{statfs} \\
+  96  & 8   & \texttt{bt\_le64} & \texttt{compat\_flags}   & unknown bit: mount rw normally \\
+  104 & 8   & \texttt{bt\_le64} & \texttt{ro\_compat\_flags} & unknown bit: mount read-only \\
+  112 & 8   & \texttt{bt\_le64} & \texttt{incompat\_flags} & unknown bit: refuse to mount \\
+  120 & 4   & \texttt{bt\_le32} & \texttt{block\_size}     & 4096 \\
+  124 & 2   & \texttt{bt\_le16} & \texttt{csum\_type}      & which algorithm fills \texttt{csum} \\
+  126 & 1   & \texttt{bt\_u8}   & \texttt{root\_level}     & depth of the root tree \\
+  127 & 1   & \texttt{bt\_u8}   & \texttt{reserved0}       & alignment, so \texttt{label} starts at 128 \\
+  128 & 32  & \texttt{bt\_u8[]} & \texttt{label}           & human-readable name for \texttt{blkid} \\
+  160 & 352 & \texttt{bt\_u8[]} & \texttt{reserved}        & future room \\
+  \midrule
+  \multicolumn{2}{r}{\textbf{512}} & & & \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{The only structure never copy-on-written.} There is nowhere to put a
+pointer to a new copy of the superblock, so it is overwritten in place every
+commit. That single overwrite \emph{is} the transaction commit: everything else
+is copy-on-written precisely so that this one write can be the moment the
+transaction becomes real.
+
+\paragraph{Why exactly 512 bytes.} If the structure spanned two sectors, a torn
+write could leave the first new and the second old. The checksum would then
+fail, and with a single superblock copy the filesystem would be unmountable.
+Padding to exactly one sector makes atomicity structural rather than hoped for,
+and \texttt{\_Static\_assert} enforces it at compile time.
+
+\paragraph{Field order.} Largest first, which incidentally lands every 64-bit
+field on an 8-byte boundary, \texttt{block\_size} on a 4-byte one and
+\texttt{label} on 16. Packing removes the compiler's right to insert padding; it
+does not prevent laying fields out sensibly by hand.
+
+\paragraph{Feature flags rather than a version number.} A single version integer
+forces a total ordering on features: version 3 must contain everything from 1
+and 2. Three flag words allow independent features to be added independently,
+and the read-only case is the interesting one. Consider adding data checksums
+later: an old reader can still read every file correctly, but were it to
+\emph{write} one it would not create the checksum items, and a newer reader
+would see data with missing checksums and call it corruption. Read-only is
+exactly the right restriction, and no version number can express it.
+
+\section{Derived constants}
+\label{sec:derived}
+
+Computed from the structure sizes rather than written down, so that changing
+the header padding updates them automatically and a stale figure cannot survive
+in the code.
+
+\begin{center}
+\begin{tabular}{lrl}
+  \toprule
+  Constant & Value & Definition \\
+  \midrule
+  \texttt{BITTER\_LEAF\_DATA\_SIZE} & 4000 & block size $-$ \texttt{sizeof(bitter\_header)} \\
+  items per leaf                    & 160  & $4000 / 25$ \\
+  children per node                 & 121  & $4000 / 33$ \\
+  \bottomrule
+\end{tabular}
+\end{center}

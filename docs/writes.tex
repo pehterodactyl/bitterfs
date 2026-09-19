@@ -1,0 +1,209 @@
+\chapter{Writing}
+\label{ch:writes}
+
+Phase~6 ended with a filesystem that could be read completely and changed not at
+all. Everything a write needs had been built --- transactions, all eight seam
+operations, the free map, a commit protocol that publishes a new superblock ---
+and nothing called any of it. This chapter is the first byte that goes the other
+way.
+
+The order the work arrived in was not the order it was planned in. One
+\code{chmod} turned out to need a VFS method nobody had listed, and finding that
+out took a test that unmounts and mounts again, because under copy-on-write a
+lost write is indistinguishable from a filesystem that was never written to.
+
+\section{The smallest possible write}
+
+\fnname{bitterfs\_setattr} was chosen first because it exercises the whole stack
+while changing as little as possible. An \itemtype{INODE\_ITEM} is a fixed
+\bytes{112} under a key that does not change, so persisting one is an in-place
+overwrite: the item keeps its slot, the leaf's layout does not move, and no
+descriptor is rewritten. \fnname{bitter\_update\_root} in \code{core/root.c} had
+exactly that shape already.
+
+The kernel's counterpart is \fnname{bitterfs\_update\_inode}, the exact
+inverse of \fnname{iget}. Its search differs from the one \fnname{iget} makes
+in two arguments and no others:
+
+\begin{quote}
+\code{trans} non-null, and \code{cow} 1.
+\end{quote}
+
+That pair is the whole difference between reading and writing. \code{cow} makes
+the descent copy every block on the way down and relink each parent, so the
+tree's root address moves --- which is why the search is handed
+\field{mnt->fs.fs\_root} itself and never a copy. That moved root is what the
+commit publishes.
+
+\subsection{Why the update is read-modify-write}
+
+\fnname{update\_inode} overwrites individual fields inside the leaf rather than
+building a fresh \code{bitter\_inode\_item} and copying it over. The reason is
+that four fields have no home in a \code{struct inode}: \field{otime},
+\field{next\_dir\_index}, \field{rdev} for anything that is not a device, and
+\field{flags}. Constructing a new item zeroes all four.
+
+Three of those would be a cosmetic loss. \field{next\_dir\_index} would not:
+it is a monotonic high-water mark, and \fnname{readdir}'s \code{f\_pos} cookie
+\emph{is} that number. Resetting it hands a future \code{create} an index some
+live entry already occupies, and the corruption surfaces much later as a
+\fnname{readdir} that skips or repeats.
+
+Writing in place costs one obligation in exchange. Every field that \emph{should}
+change and is forgotten stays stale rather than becoming visibly zero, so there
+is no crash to find it by. The set that must move is \field{mode}, \field{uid},
+\field{gid}, \field{size}, the three timestamps, and \field{generation} on every
+call --- the last from \field{trans->generation}, never from
+\field{inode->i\_generation}, which is a truncated \code{u32} copy of what the
+item said when it was read.
+
+\decide{\field{otime} and \field{next\_dir\_index} are safe on disk and
+unreadable in memory, because \code{struct inode} has nowhere to put them. The
+third thing wanting a \code{bitterfs\_inode} wrapper is \field{i\_ino} being
+\code{unsigned long}, which truncates on a 32-bit build. The wrapper arrives
+when one of the three stops being theoretical.}
+
+\section{Making the mount writable}
+
+\fnname{fill\_super} had forced \code{SB\_RDONLY} on every mount since phase~5,
+with a comment that was true when written --- nothing in the module could write,
+because every operation in \code{env\_kernel.c}'s write half was an assertion.
+The seam became real at phase~7 and the comment did not. Until that line went,
+\code{chmod} was refused by the VFS and \fnname{setattr} was unreachable code.
+
+Dropping it is safe because absent methods refuse rather than half-run. With no
+\field{->create}, \field{->mkdir} or \field{->unlink} the VFS answers
+\code{-EACCES} before reaching the filesystem, and with no \field{->write\_iter},
+\code{write(2)} fails at the file operations. \code{SB\_RDONLY} stopped being a
+constant and became a runtime verdict: it is now what a failed write sets.
+
+\section{The commit that never came}
+
+With \fnname{setattr} correct and wired, \code{chmod} returned 0, \fnname{stat}
+reported the new mode, and an unmount followed by a fresh mount reported the old
+one. \fnname{bitter-fsck} found zero problems, which is the part worth
+remembering: nothing was wrong with the image, only with what was missing from
+it.
+
+\fnname{bitterfs\_trans\_end} commits only when the delayed-ref set nears
+capacity --- 3968 of 4096. That threshold is right for what it was written to
+do, which is stop a burst of small operations paying for a commit each. What it
+assumed, without saying so, is that \emph{something} would eventually force the
+issue. Nothing did. A \code{chmod} adds a handful of refs, \fnname{kill\_sb}
+frees the mount's arrays without committing, and there was no \field{->sync\_fs}
+because there was no \code{s\_op} table at all --- \field{sb->s\_op} was the
+VFS's all-\code{NULL} \code{default\_op}, so every \code{s\_op->} call in
+\code{fs/} skipped bitterfs in silence.
+
+\fnname{bitterfs\_sync\_fs} commits whatever is live regardless of the
+threshold, and one method covers three callers because they all route through
+\fnname{sync\_filesystem}: \code{sync(1)}, remount-to-read-only, and unmount ---
+\fnname{generic\_shutdown\_super} syncs before it calls \field{->put\_super}.
+The batching then means what it was always meant to: batch within a sync
+interval, rather than never commit.
+
+Two details of \fnname{sync\_filesystem} shape the implementation. It returns
+immediately on a read-only superblock, so the failure policy that sets
+\code{SB\_RDONLY} also disables unmount's commit --- coherent, and worth knowing.
+And it calls the method twice, \code{(sb,\,0)} then \code{(sb,\,1)}, so that
+\code{sync(1)} across many filesystems can start I/O on all of them before
+blocking on any. \fnname{trans\_commit} is synchronous and flushes the device
+itself, so there is nothing to spread across the two passes and only the
+blocking one acts.
+
+\subsection{One policy, three callers}
+
+\fnname{trans\_end} and \fnname{sync\_fs} then said the same thing twice, and
+\fnname{setattr} said half of it a third time. Factored into
+\fnname{bitterfs\_commit} and \fnname{bitterfs\_write\_failed}.
+
+The split is not arbitrary. \fnname{setattr} can never call
+\fnname{bitterfs\_commit}, because its failure is an inode write failing rather
+than a commit failing, so a single helper would have left out the very site that
+needs the policy most: \fnname{setattr\_copy} has already changed the cached
+inode by then, and memory and disk disagree with no error left to find them by.
+
+\fnname{write\_failed} takes the stage that failed as a string, so the log line
+distinguishes a failed tree write from a failed inode write. Before it existed,
+a failed commit wedged the mount in complete silence.
+
+\decide{\code{SB\_RDONLY} plus a still-set \field{trans\_live} is standing in for
+a real errored mount state. Nothing is recorded on disk, so the next mount has no
+idea anything went wrong, where ext4 writes \code{EXT4\_ERROR\_FS} into its
+superblock and btrfs keeps \code{BTRFS\_FS\_STATE\_ERROR}.
+\fnname{write\_failed} is the one place that changes when it arrives.}
+
+\section{The buffered write path}
+
+File data is the next piece, and where it puts its locks is decided by a hazard
+that predates the API.
+
+A buffered write copies from a userspace buffer into the page cache, and nothing
+stops that buffer from being a mapping of a file --- possibly the same file, at
+the same offset, being written. Under the old \field{prepare\_write} /
+\field{commit\_write} interface the copy was an ordinary \fnname{copy\_from\_user}
+performed with the destination page already locked, and both variants deadlock.
+
+If the source is the same page, the fault handler looks it up and tries to lock a
+page this task locked two lines earlier. If the source is a different file on the
+same filesystem, the fault reaches \field{->read\_folio}, which takes the
+filesystem's own locks --- and deadlocks against whatever the write path is
+already holding.
+
+\subsection{What fixed it}
+
+Three mechanisms, layered, of which only one is the guarantee.
+
+\fnname{fault\_in\_iov\_iter\_readable} touches the source pages before the
+destination is locked, so the common case has nothing left to fault on. That is a
+mitigation: the page can be reclaimed in the gap.
+
+\fnname{copy\_folio\_from\_iter\_atomic} runs the copy with
+\fnname{pagefault\_disable}. A fault inside the locked window cannot recurse into
+the filesystem; it makes the copy return short. This is the guarantee, and it is
+why recursion is impossible rather than merely unlikely.
+
+A short copy is not an error. \fnname{generic\_perform\_write} retries, faulting
+in again and halving the chunk if it makes no progress, and only then returns
+\code{-EFAULT}.
+
+The API changed in the same work. \field{prepare\_write} was called with the page
+\emph{already} locked by the VFS, so a filesystem inherited a lock ordering it
+had not chosen. \field{write\_begin} hands that back --- the filesystem grabs the
+folio itself, and can take its own locks before or after as it needs. That is
+what lets ext4 start a journal handle and then lock the folio.
+
+\subsection{Where bitterfs puts its lock}
+
+So holding a lock or a transaction across \field{write\_begin} to
+\field{write\_end} is safe, and ext4 depends on it. bitterfs does not, for a
+reason that is local rather than principled: \fnname{bitterfs\_get\_block}
+asserts \code{BITTER\_BLOCK\_SIZE == PAGE\_SIZE}, so one folio is one block and a
+per-page transaction and a per-block transaction are the same transaction. The
+wider window buys nothing and costs a lock acquired in one callback and released
+in another, across error paths in both.
+
+\fnname{get\_block} already takes \field{mnt->lock} for reads. The write path
+takes it the same way and opens a transaction \emph{only} on the \code{create}
+branch --- a read path that opened one would be a write path with no writes in
+it, leaving \field{trans\_live} set with nothing to commit.
+
+The cost looks worse than it is. A \mib{1} write means 256 \fnname{get\_block}
+calls and so 256 \fnname{trans\_begin}/\fnname{trans\_end} pairs, but
+\fnname{trans\_begin} joins rather than starting fresh and \fnname{trans\_end}
+commits only at the threshold. Those 256 pairs produce a handful of commits. The
+batching that went unused for a whole phase exists for exactly this caller.
+
+\section{What the tests assert}
+
+\code{qemu/guest.sh} was rebuilt around a round trip, because that is the only
+shape that can see a lost write. \code{chmod} reporting a new mode proves only
+that \fnname{setattr\_copy} touched the cached inode. The load-bearing checks
+unmount, mount again, and read the values back out of \fnname{stat}: mode, uid,
+gid on the file, mode on the directory, and the file's contents and size intact
+afterwards.
+
+The refused \code{truncate} is checked too, and for a reason beyond coverage:
+\fnname{setattr\_copy} does not touch \field{i\_size}, so an \code{ATTR\_SIZE}
+allowed to fall through would report success and change nothing --- the same
+silent shape as the missing commit, arriving by a different route.

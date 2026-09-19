@@ -1,0 +1,98 @@
+#!/bin/sh
+# ===========================================================================
+# /init — PID 1 for the bitterfs guest
+# ===========================================================================
+#
+# The kernel unpacks the initramfs into a tmpfs, makes it /, and execs this
+# file as process 1.  Nothing else runs first: no bootloader script, no
+# systemd, no /etc/rc.  Whatever is not set up here does not exist.
+#
+# Two rules that make PID 1 different from an ordinary script:
+#
+#   1. It must never exit.  If this file returns — even successfully — the
+#      kernel panics with "Attempted to kill init".  Hence the `exec` on the
+#      last line, and hence NO `set -e`: a failed mount should leave you at a
+#      shell with a warning, not kill the machine.
+#
+#   2. It gets almost no environment.  The kernel passes exactly HOME=/ and
+#      TERM=linux.  See the PATH line below.
+#
+# --- notation, since this file is dense with it -----------------------------
+#   #!/bin/sh     "shebang".  The kernel's script loader only recognises a file
+#                 as a script if its first two bytes are #!.  Without it, exec
+#                 fails outright and PID 1 never starts.
+#   A || B        run B only if A FAILED   (|| = "or else")
+#   A && B        run B only if A SUCCEEDED (&& = "and then")
+#   [ -x path ]   the test command.  `[` is a program name and `]` is its final
+#                 argument, which is why both need spaces around them —
+#                 `[-x foo]` makes the shell hunt for a command called `[-x`.
+#                 -x means "exists and is executable".
+#   exec CMD      REPLACE this process with CMD instead of starting a child.
+#                 For PID 1 that matters: a child would run while init sat
+#                 waiting, and if init ever returned, panic.
+#   \             at end of line: continue this command on the next line.
+# ===========================================================================
+
+# The kernel hands init an environment of just HOME=/ and TERM=linux — there is
+# no PATH.  Busybox's shell usually falls back to a compiled-in default, but if
+# it does not, every command below fails with "not found" and the initramfs
+# looks broken when it is fine.  mkinitramfs.sh puts all ~272 applets in /bin,
+# so that is the whole path.
+export PATH=/bin
+
+# --- pseudo-filesystems ----------------------------------------------------
+# None of these are real storage; they are kernel state presented as files.
+#
+#   /proc  process and kernel information — /proc/mounts, /proc/modules
+#   /sys   the device model — where a filesystem registers itself, and where
+#          lsmod and modinfo read from
+#   /dev   device nodes
+#
+# devtmpfs must be mounted BY HAND here.  CONFIG_DEVTMPFS_MOUNT (which is
+# enabled) says the kernel mounts it before calling init, and that is true only
+# when booting a real root filesystem — explicitly not for an initramfs.  Skip
+# this line and /dev/vda simply does not appear, no matter how correctly
+# virtio-blk is compiled in.
+mount -t proc     proc     /proc
+mount -t sysfs    sysfs    /sys
+mount -t devtmpfs devtmpfs /dev
+
+# --- the host source share -------------------------------------------------
+# The heart of the dev loop: build bitterfs.ko on the host, insmod it here, no
+# image rebuild in between.
+#
+#   src              must match mount_tag=src in QEMU's -virtfs flag; the two
+#                    are halves of one name
+#   trans=virtio     carry 9p over the virtio transport rather than a network
+#   version=9p2000.L the Linux dialect.  The default 9p2000.u lacks POSIX
+#                    semantics you will want
+#   msize=512000     transfer chunk size.  The default is small enough that
+#                    reading a KASAN-sized .ko over the share is noticeably
+#                    slow on every single iteration
+#
+# The `||` matters: on failure you want a warning and then a usable shell, not
+# a silently empty /mnt/src that looks like the share mounted fine.
+mount -t 9p -o trans=virtio,version=9p2000.L,msize=512000 src /mnt/src \
+    || echo "Warning: 9p share failed to mount"
+
+# --- hand off --------------------------------------------------------------
+# If the share provides a guest.sh, run it instead of sitting at a prompt.
+# This is what keeps the initramfs frozen: guest-side logic lives on the share,
+# edited in your normal editor, so this archive gets packed once and never
+# again.  Later it is also how the phase-9 crash harness drives the VM
+# unattended — write a script, boot, collect the result.
+#
+# `exec` replaces init with that script, so guest.sh becomes PID 1 and inherits
+# the must-not-exit rule.
+[ -x /mnt/src/qemu/guest.sh ] && exec /mnt/src/qemu/guest.sh
+
+# Fallback: an interactive shell.  Reached when there is no guest.sh, or the
+# share failed to mount.
+#
+#   setsid    start a new session, so this shell can own a terminal
+#   cttyhack  attach that terminal as the CONTROLLING terminal — this is what
+#             makes Ctrl-C interrupt a runaway command rather than doing
+#             nothing at all
+#
+# Last line, and an exec: nothing may follow, or init could return and panic.
+exec setsid cttyhack sh

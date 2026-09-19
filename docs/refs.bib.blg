@@ -1,0 +1,14 @@
+[2] Config.pm:307> INFO - This is Biber 2.19 running in TOOL mode
+[3] Config.pm:310> INFO - Logfile is 'refs.bib.blg'
+[654] biber:340> INFO - === Wed Aug 26, 2026, 12:49:23
+[864] Biber.pm:4606> INFO - Looking for bibtex file 'refs.bib'
+[872] bibtex.pm:1713> INFO - LaTeX decoding ...
+[946] bibtex.pm:1519> INFO - Found BibTeX data source 'refs.bib'
+[1449] Biber.pm:1670> INFO - Datamodel validation starting
+[1465] Biber.pm:1720> INFO - Datamodel validation complete
+[1518] UCollate.pm:68> INFO - Overriding locale 'en_US' defaults 'variable = shifted' with 'variable = non-ignorable'
+[1519] UCollate.pm:68> INFO - Overriding locale 'en_US' defaults 'normalization = NFD' with 'normalization = prenormalized'
+[1519] Biber.pm:4239> INFO - Sorting list 'tool/global//global/global' of type 'entry' with template 'tool' and locale 'en_US'
+[1519] Biber.pm:4245> INFO - No sort tailoring available for locale 'en_US'
+[1561] bibtex.pm:440> INFO - Writing '/dev/null' with encoding 'UTF-8'
+[1564] bibtex.pm:480> INFO - Output to /dev/null

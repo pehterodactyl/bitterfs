@@ -1,0 +1,236 @@
+\chapter{Allocation and reference counting}
+\label{ch:extents}
+
+Until this point blocks came from a bump cursor: a high-water mark in
+\code{struct bitter\_root}, advanced on every allocation and never moved back.
+Nothing was ever reclaimed, and a leaf that emptied held its block forever.
+That was fine while no workload deleted enough to notice.
+
+This chapter is what replaces it. An \emph{extent tree} records which ranges of
+the device are in use and how many things point at each; an allocator hands out
+addresses from what is left over; and a reference count decides when a range
+becomes available again. Refcounting is also what will make snapshots work, and
+what makes them safe to delete --- a snapshot is nothing but a second reference
+to a subtree.
+
+It is the one place in the filesystem where an off-by-one silently corrupts
+data. A range freed while still referenced is handed out again and overwritten,
+and the damage is invisible until something reads what used to be there.
+
+
+\section{The extent tree}
+
+Extent items are keyed \keytriple{bytenr}{EXTENT\_ITEM}{length}: the range's
+start address is the objectid, its length is the offset. The payload is a
+reference count and a flags word, and nothing else --- the key already says
+which range is being described.
+
+Two properties follow from that choice, and both are load-bearing.
+
+\paragraph{Absence means free.} An extent has an item if and only if something
+references it. The last reference does not write a zero; it deletes the item.
+Free space is therefore not stored anywhere --- it is the complement of what is
+stored, and the filesystem never has to keep two representations of the same
+fact in step.
+
+\paragraph{The tree is in device order.} Keys sort by objectid first, and here
+the objectid is an address. So walking the extent tree from its first item to
+its last visits every allocated range in ascending order, and the gaps between
+consecutive items are exactly the free ranges, already sorted. That turns the
+mount-time scan into a single linear pass with no sorting and no index.
+
+
+\section{The free-space map}
+
+\code{struct bitter\_fs\_info} holds an array of
+\code{struct bitter\_free\_extent}, each a \code{\{start, length\}} pair in
+device order. It is built once, at mount, by walking the extent tree and
+recording the gaps.
+
+It is a \emph{cache}. The extent tree is the durable truth; the map is a
+restatement of it that is faster to allocate from, thrown away at unmount and
+rebuilt at the next one. Nothing about it reaches the disk, which is why
+\code{bitter\_free\_extent} lives in \code{core/fs.h} and not in the format
+header: no packing, no little-endian accessors, no layout assertions. Getting
+its representation wrong costs a recompile, not a migration.
+
+\paragraph{Every allocation is one block.} That collapses the classic allocator
+policy question. First-fit, best-fit and worst-fit differ only when requests
+vary in size, so with a uniform \bytes{4096} they produce identical
+fragmentation and the simplest wins: take the first range, advance its start,
+shrink its length, and drop the entry when it reaches zero.
+
+\paragraph{Taking from the front is the right end.} It allocates low addresses
+first, keeping the used region compact and preferentially consuming the
+single-block holes that deletes leave behind --- each of which \emph{shortens}
+the map when it is exhausted. Taking from the back would be cheaper to remove
+but would grow the filesystem outward and leave the holes forever.
+
+\paragraph{An empty map is the out-of-space condition.} Not an arithmetic
+comparison against the device size, just \code{free\_count == 0}. Which is both
+cheaper and more honest than the bump allocator's
+\code{next\_free + BLOCK > total\_bytes}, an expression that had been copied
+into nine call sites so each could distinguish \code{ENOSPC} from
+\code{ENOMEM}.
+
+
+\section{Describing the whole device}
+
+The scan derives free space by subtraction, so it is only as good as what the
+extent tree describes. If a block is in use and has no item, the scan reports
+it as free and the allocator hands it out.
+
+mkfs therefore records what it writes: an item covering the reserved prefix and
+the superblock, and one for each of the two tree blocks it lays down. With
+those present the extent tree accounts for every byte of the device, the scan
+needs no hardcoded constants, and \code{core/} learns the layout by reading it
+rather than by being told.
+
+\paragraph{What happened before that was true.} A freshly formatted image
+reported one free range covering the entire device from address 0, and the
+allocator began handing out the reserved prefix, the superblock, and the two
+trees. Nothing failed at allocation time --- every write succeeded. It surfaced
+as a checker rejecting a block on the 118th insert, several calls after the
+allocation that had overwritten it. The symptom was a corrupt tree; the cause
+was a correct allocator obeying a map that was telling the truth about a
+filesystem which had not described itself.
+
+The generalisation is worth keeping: a wrong derivation does not produce an
+error, it produces a plausible answer.
+
+
+\section{The recursion}
+
+Recording an allocation means adding a reference to the extent tree. Adding a
+reference means modifying the extent tree, which copy-on-writes its blocks,
+which allocates --- which needs another reference recorded. The cycle does not
+obviously terminate, and each level of it mutates the tree the level above is
+walking.
+
+\paragraph{Delayed references break it.} An allocation does not touch the
+extent tree at all. It appends a record --- address, length, $\pm 1$ --- to an
+array on the open transaction, and the whole set is applied at commit, at a
+point where allocating is no longer reentrant.
+
+That is safe because the in-memory free map has \emph{already} been updated.
+The block leaves the free list the instant it is handed out, so nothing else
+can be given the same address before the set is drained. Only the durable
+record lags, and only until commit.
+
+\paragraph{The signature enforces it.} \fnname{trans\_add\_delayed\_ref} takes
+no environment. It cannot read a block, cannot descend a tree, and cannot
+allocate, so the recursion is impossible rather than merely avoided. The same
+device as passing a null transaction to \fnname{btree\_search} to prove a
+lookup cannot write.
+
+\paragraph{Merging.} Recording looks for an existing entry with the same
+address and length and adds to its delta, and an entry that reaches zero is
+removed. So a block allocated and then freed inside one transaction never
+reaches the extent tree at all --- which is the common case for a split that is
+later abandoned. Without merging the tree would be copy-on-written twice to
+create an item and immediately delete it.
+
+The match must be exact. \code{[0x1000, 0x2000)} and \code{[0x0, 0x11000)} are
+different items even though one range contains the other, and treating
+containment as a match would apply a delta to an item that does not exist.
+
+\paragraph{Draining converges.} Applying an entry copy-on-writes the extent
+tree, which allocates, which appends new entries to the set being drained. So
+the drain loops until the set is empty rather than iterating a saved count, and
+each entry is removed \emph{before} it is applied, so the array can be appended
+to safely while one of its entries is in flight.
+
+It terminates because copy-on-write is idempotent within a transaction: once a
+block carries the current generation it is modified in place and allocates
+nothing. Each pass therefore touches fewer blocks than the last, and eventually
+one touches none. That is an argument rather than a proof, so the loop carries
+a bound --- a convergence claim that turns out to be wrong should fail where it
+can be read, not hang inside a commit.
+
+
+\section{Commit ordering}
+
+The transaction commit gains two steps ahead of the ones it already had:
+
+\begin{enumerate}
+  \item drain the delayed-ref set into the extent tree;
+  \item record the extent tree's moved root in the root tree;
+  \item repeat until the set is empty \emph{and} the extent root stops moving;
+  \item \code{writeback\_all}, then \code{flush\_device};
+  \item overwrite the superblock;
+  \item \code{flush\_device} again.
+\end{enumerate}
+
+Steps 1--3 must precede step 4 because draining dirties extent-tree blocks, and
+must precede step 5 because the extent tree's root moves while it runs. Step 2
+copy-on-writes the \emph{root} tree, which allocates, which refills the set ---
+which is why 1 and 2 are a loop rather than a sequence.
+
+Steps 4--6 are unchanged from the transaction chapter: the first flush is the
+ordering barrier that stops the superblock reaching the disk before the blocks
+it points at, and the single superblock overwrite is the moment the transaction
+becomes real.
+
+
+\section{What is not reclaimed}
+
+A block freed during a transaction is still referenced by the \emph{committed}
+filesystem --- the one the superblock points at, the one that survives a crash
+at this instant. Returning it to the free map would let the allocator hand it
+out and overwrite it, and a crash before the superblock write would then leave
+an intact old tree reading a block containing something else. A filesystem that
+was consistent would be destroyed by a transaction that never completed.
+
+btrfs solves this by \emph{pinning}: extents freed during a transaction go to a
+separate set and join the free map only after the commit completes. bitterfs
+does something simpler and strictly weaker --- it never returns space to the
+map at all during a mount. The map only shrinks; freed space becomes available
+at the next mount, when the scan rebuilds it from an extent tree that no longer
+mentions those ranges.
+
+That makes the hazard structurally impossible rather than carefully avoided,
+which is the right trade while the mechanism that would get it right does not
+exist. The cost is real and bounded: a long-running mount that deletes heavily
+can report \code{ENOSPC} with most of the device unreferenced.
+
+\decide{The specific temptation to resist is rebuilding the map at the end of
+the drain. The map it produced would be perfectly consistent with the extent
+tree --- and would resurrect every block freed this transaction, into a
+transaction that is still allocating.}
+
+
+\section{Checking it}
+
+A reference count that drifts is invisible until a block is freed while still
+referenced, and by then the evidence is gone. That is why
+\fnname{bitter-fsck} belongs to this phase rather than a later one.
+
+Its central question is a comparison: what the trees actually point at, versus
+what the extent tree claims. It walks every block of every tree with an
+explicit worklist --- recording one observation per \emph{pointer}, so the
+count falls out of how many times an address appears --- then sorts the
+observations and merges them against the extent tree's items, which are already
+in address order.
+
+Three findings fall out of that single pass:
+
+\begin{itemize}
+  \item a count that disagrees with the number of pointers found;
+  \item an item nothing points at, which is a leak: space lost until the
+        filesystem is rebuilt;
+  \item a block pointed at with no item at all, which is the dangerous
+        direction --- the allocator believes that range is free.
+\end{itemize}
+
+Walking every block also makes the per-block checks available for the first
+time on the whole image rather than on one search path: \field{level} against
+what the parent claimed, \field{generation} against the duplicate in the
+\code{key\_ptr}, and \field{owner} against the tree being walked. That last one
+is the only reader the field has ever had, and it detects a block cross-linked
+into two trees --- intact, correctly addressed, and belonging to somebody else,
+which the checksum and the self-address check both miss by design.
+
+\paragraph{fsck is read-only,} and not merely out of caution. A tool run to
+find damage must not be able to overwrite the evidence. It reports and counts;
+it repairs nothing. A repair that is wrong is worse than no repair, and the way
+to earn confidence in one is to have a detector that is already trusted.

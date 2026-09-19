@@ -1,0 +1,220 @@
+\chapter{Running in the kernel}
+\label{ch:kernel}
+
+Everything so far has run in userspace, where a mistake is a segfault under
+\code{gdb} and thirty seconds. This chapter is the first time \code{core/} runs
+inside the kernel, where the same mistake is a panic and a reboot.
+
+The claim being tested is the one the seam has been making since phase~1: that
+if \code{core/} is honest about its dependencies, arriving in the kernel adds a
+second environment implementation and changes nothing above it. That claim
+turns out to hold, and the evidence arrived before a line of VFS code was
+written --- see \S\ref{sec:kernel-buildproof}.
+
+What phase~5 does \emph{not} produce is a working mount. The on-disk format has
+no FS tree, so there is no root directory to build an inode from and nothing to
+hand \fnname{d\_make\_root}. Mounting therefore ends in a refusal --- but a
+refusal that has already read the superblock, validated it six ways, and walked
+into the root tree through the new environment. Every step before the last one
+is permanent.
+
+\section{Two builds of one directory}
+\label{sec:kernel-buildproof}
+
+\code{core/} is compiled twice from the same sources: by \code{core/Makefile}
+into \code{libbitter.a} for the tools and tests, and by Kbuild with the
+kernel's own flags into \code{bitterfs.ko}. Nothing in it is conditional on
+which.
+
+Kbuild builds each object into a directory beneath \code{M=}, and a line
+reading \code{bitterfs-y += ../core/btree.o} asks it to write outside the tree
+it was told to manage. The resolution was to move \code{M=} \emph{up} to the
+repository root rather than reach down from \code{kernel/}: every object is
+then genuinely beneath it, and \code{-I\$(src)} resolves to the same directory
+\code{core/Makefile} passes as \code{-I\$(TOP)}, so an include means the
+identical thing in both builds.
+
+The first such build is the proof. All eight \code{core/} files compiled under
+kernel flags with no errors and no warnings, and the module's complete list of
+undefined symbols was:
+
+\begin{quote}
+\code{\_printk}, plus compiler-inserted KASAN, stack-protector and retpoline
+entries.
+\end{quote}
+
+\code{core/} requires nothing from the kernel --- not even \fnname{memcpy},
+since \code{core/bitter\_string.h} supplies its own. Four phases of
+\code{make freestanding} bought exactly what that target claimed it would.
+
+The cost was discovered immediately afterwards, and is recorded in
+\code{docs/LOG.md}: both builds wanted to write \code{core/btree.o}, and the
+kernel's object is \code{-mcmodel=kernel}, non-PIE and KASAN-instrumented.
+Archiving it into \code{libbitter.a} fails the userspace link with a message
+that names neither the kernel nor the cause. The userspace build now writes to
+\code{core/build/}.
+
+\section{Stopping}
+
+\code{core/bitter\_assert.h} declares \fnname{bitter\_assert\_fail} and leaves
+each consumer to define it: \code{user/util.c} prints and calls
+\fnname{abort}, and \code{kernel/assert.c} is the kernel's answer. A link-time
+seam rather than an entry in \code{bitter\_env\_ops}, because there is nothing
+per-filesystem to configure.
+
+The header specifies \code{\_Noreturn}, and that is a promise rather than a
+mechanism: the compiler deletes the fall-through path at every call site. A
+kernel implementation that warned and continued would therefore not merely
+behave oddly, it would execute whatever bytes followed the call.
+
+\code{BUG()} satisfies the promise honestly. On x86 it is three lines --- an
+\code{ud2} planted inline, and \fnname{\_\_builtin\_unreachable} to tell the
+compiler so. The trap handler prints, dumps registers and a stack trace, and
+kills the \emph{task}.
+
+\paragraph{Why the function prints first.} \code{CONFIG\_DEBUG\_BUGVERBOSE}
+prints a file and line of its own, but they come from \code{\_\_bug\_table} and
+name the site of the \code{BUG()} macro --- which is \code{kernel/assert.c},
+every time, whichever invariant actually failed. The \field{expr},
+\field{file} and \field{line} arguments are the only carriers of the real
+location, and nothing prints them for you.
+
+\decide{Task-fatal was chosen over \fnname{panic}, so the guest survives long
+enough to read \code{dmesg}. The cost is that nothing unwinds: the
+filesystem-wide mutex is never released and the mount hangs, with
+\code{CONFIG\_DETECT\_HUNG\_TASK} burying the message under a splat every 120
+seconds. Reconsider when an assertion fires somewhere reboot-hostile.}
+
+\section{The second environment}
+
+\code{kernel/env\_kernel.c} supplies the six operations of
+\code{bitter\_env\_ops} over the buffer cache, as \code{user/env\_user.c}
+supplies them over \fnname{pread} and \fnname{malloc}.
+
+Read-only reaches two of them. \fnname{alloc\_block\_buf},
+\fnname{dirty\_block}, \fnname{flush\_device} and \fnname{writeback\_all} are
+all write-side, and each is a \code{BITTER\_ASSERT(0)}: \code{core/} arriving
+there is a bug in the module rather than anything the disk did, which is the
+test \code{bitter\_assert.h} states. Each still returns afterwards, because
+\code{BITTER\_ASSERT} compiles to nothing without \code{BITTER\_DEBUG} and a
+non-void function must not fall off its end.
+
+\fnname{bitterfs\_read\_block} is where the work is. It fetches through
+\fnname{sb\_bread}, which is a cache lookup first and a synchronous read only
+on a miss, and then applies the same three self-identifying checks
+\code{env\_user} applies, in the same order and for the same reason: checksum
+says the bytes are intact, \field{bytenr} says it is the block that was asked
+for, \field{fsid} says it belongs to this filesystem rather than to a previous
+\fnname{mkfs} at the same address. Each presupposes the one before it.
+
+Three differences from the userspace version are worth stating.
+
+\paragraph{No copy.} \field{b\_data} points \emph{into} the page cache. The
+buffer head is a descriptor; the bytes live in a cached page, and copying them
+would decouple what \code{core/} modifies from what is eventually written.
+
+\paragraph{Allocation comes last.} \code{env\_user} must allocate first,
+because it reads into its own storage. \fnname{sb\_bread} hands over the data,
+so a block that fails a check costs no allocation at all --- and there is one
+fewer failure path to unwind.
+
+\paragraph{No \field{have\_fsid} gate.} \code{env\_user} gates its fsid check
+because \fnname{mkfs} and the unit fixtures use the seam with no superblock at
+all. The kernel has no such caller: every read happens after
+\fnname{fill\_super} has read the superblock, because \fnname{fill\_super} is
+what installs the vtable. The invariant is enforced by what is reachable rather
+than by a flag --- but it is then \fnname{fill\_super}'s to keep, and it is
+written down on the struct in \code{kernel/bitterfs.h}. An unarmed fsid is
+sixteen zero bytes, which would silently match a zeroed block rather than fail.
+
+\decide{\code{core/} has never run against a caching environment. Two
+\fnname{read\_block} calls for one address alias in the kernel and do not in
+userspace, and every test uses the latter. Harmless while nothing writes. See
+\code{docs/LOG.md}.}
+
+\section{Mounting}
+
+\code{kernel/super.c} uses the \code{fs\_context} mount API --- an
+\fnname{init\_fs\_context} that installs an operations table, a
+\fnname{get\_tree} that calls \fnname{get\_tree\_bdev}, and a
+\fnname{reconfigure} that reasserts read-only. The legacy \fnname{mount\_bdev}
+form would have been three lines instead of twelve; \code{fs\_context} was
+chosen because mount options arrive through a typed \fnname{parse\_param}
+rather than an unparsed blob, and because \fnname{errorfc} reports failures to
+whoever ran \code{mount}. That last point decided it: for the whole of phase~5,
+\fnname{fill\_super}'s job \emph{is} to refuse and say why.
+
+\subsection{Ordering}
+
+\fnname{fill\_super} has five constraints, and each exists because something
+downstream reads what the previous step wrote.
+
+\begin{enumerate}
+\item \fnname{sb\_set\_blocksize} before any read, because \fnname{sb\_bread}
+      counts in \field{sb->s\_blocksize}. It returns \code{0} on failure ---
+      the opposite convention to \fnname{set\_blocksize} beneath it, so the
+      check is truthiness and not \code{< 0}.
+\item \field{s\_fs\_info} assigned immediately after the allocation, which
+      hands ownership of the mount struct to \fnname{kill\_sb}. From that line
+      on, no error path frees it; doing so would be a double free.
+\item The superblock read \emph{outside} the seam. \fnname{read\_block} cannot
+      read it: the checksum covers \bytes{512} rather than the whole block, the
+      layout is \code{bitter\_super} rather than \code{bitter\_header} so the
+      field offsets differ, and the fsid it would check against is the value
+      this read supplies.
+\item Fields copied out before the \fnname{brelse}, because the pointer aims
+      into the page cache.
+\item \fnname{bitterfs\_env\_init} only after the fsid is stored --- see the
+      previous section.
+\end{enumerate}
+
+\paragraph{Cleanup is asymmetric.} \fnname{put\_super} does not run when
+\fnname{fill\_super} fails, because \fnname{generic\_shutdown\_super} guards it
+with \code{if (sb->s\_root)} and \field{s\_root} is never set on a failed
+mount. \fnname{kill\_sb} \emph{does} run. That is why the freeing lives there
+and not in a \code{super\_operations} method: it is the one that runs both ways.
+
+\subsection{Six checks and one label}
+
+Magic first, and silently: this is the ``not mine'' answer, and \code{mount}
+may be probing several filesystem types in turn. \code{-EINVAL} with no text is
+how a filesystem declines a device politely.
+
+Every check after it means ``this \emph{is} a bitterfs and something is wrong
+with it,'' which is when the caller needs to be told what. Checksum,
+\field{bytenr}, \field{block\_size} and \field{root\_level} report
+\code{-EUCLEAN}; \field{csum\_type} reports \code{-EOPNOTSUPP}, because the
+field is valid and names an algorithm this build does not implement rather than
+describing damage. That is the same category the feature flags will fall into,
+and they will want checking in the same place.
+
+All six exit through one \code{out\_brelse} label. \code{core/}'s
+\fnname{bitter\_path\_release} makes the argument for why: the paths that owe a
+release are precisely the ones least likely to be exercised.
+
+\section{What the first mount proved}
+
+\begin{quote}
+\code{bitterfs: no FS tree in this image (-2)}
+\end{quote}
+
+\code{-2} is \code{-BITTER\_ENOENT}, returned by \fnname{bitter\_find\_root}.
+Reaching it required setting the block size, reading the superblock at block
+16, passing all six checks, arming the seam, and then calling into
+\code{core/} --- which went through \fnname{bitterfs\_read\_block}, fetched the
+root tree block, verified its checksum, \field{bytenr} and \field{fsid},
+searched the leaf, and found no \itemtype{ROOT\_ITEM} for
+\code{BITTER\_FS\_TREE\_OBJECTID}. \fnname{put\_block} then released it, and
+\code{rmmod} was clean with KASAN watching, so nothing leaked.
+
+The error is reported as \code{-EUCLEAN} rather than passed through.
+\code{BITTER\_ENOENT} is 2, which is \code{ENOENT}, and a mount failing with
+``no such file or directory'' reads as though the \emph{device} were missing.
+
+The automated check in \code{qemu/guest.sh} asserts that exact message and that
+exact number, so any earlier failure --- a bad checksum, a foreign fsid, an I/O
+error --- fails the test rather than passing quietly.
+
+\decide{The mount ends here until the on-disk format grows an FS tree: inode
+items, directory entries, and a root directory for \fnname{mkfs} to create.
+That is userspace work, and it is what phase~5 has left.}
